@@ -61,15 +61,15 @@ When creating the Application Key, grant **all** of the following scopes:
 |-------|----------------|
 | `dashboards_read` | Dashboard configurations |
 | `monitors_read` | Monitor and alert configurations |
+| `monitors_downtime` | Downtime / maintenance window configurations |
 | `org_management` | Organization settings and metadata |
-| `logs_read_config` | Log pipeline and log index configurations |
+| `logs_read_config` | Log pipeline and index configurations |
 | `synthetics_read` | Synthetic test configurations |
 | `slos_read` | SLO configurations |
-| `monitors_downtime` | Downtime configurations |
 | `metrics_read` | Metric metadata |
-| `integrations_read` | Webhook integrations |
-| `user_access_read` | Users and roles |
-| `teams_read` | Teams |
+| `integrations_read` | Webhook and integration configurations |
+| `user_access_read` | User accounts |
+| `teams_read` | Team configurations |
 
 **For usage analytics** (`--usage` flag), two additional scopes are required:
 
@@ -82,44 +82,33 @@ When creating the Application Key, grant **all** of the following scopes:
 
 ### Verify Access and Permissions
 
-**Always run `--test-access` before your first full export.** It probes every API category the script calls — without writing any data — and reports exactly which scopes are working and which are missing.
+Before running a full export, use the built-in access test to confirm that your credentials are valid and that your Application Key has the required scopes for every export category. The test probes each API endpoint individually and reports a PASS / FAIL / WARN result per category — no data is written to disk.
+
+**bash:**
 
 ```bash
-# Bash
 ./dma-datadog-export.sh \
   --api-key "your-api-key" \
   --app-key "your-application-key" \
   --test-access
+```
 
-# PowerShell
+**PowerShell:**
+
+```powershell
 .\dma-datadog-export.ps1 `
   -ApiKey "your-api-key" `
   -AppKey "your-application-key" `
   -TestAccess
 ```
 
-Example output:
+| Result | Meaning |
+|--------|---------|
+| `PASS` | Endpoint returned data — credentials and scope confirmed |
+| `WARN` | Endpoint returned an empty list — credentials valid but scope may be missing or the category has no items yet |
+| `FAIL` | Endpoint returned 401, 403, or no response — check key values and required scopes |
 
-```
-+----------------------------------------+--------+--------------------------------------+
-| Category                               | Status | Detail                               |
-+----------------------------------------+--------+--------------------------------------+
-| Credentials (validate)                 | PASS   | Authenticated OK                     |
-| Organization                           | PASS   | Acme Corp                            |
-| Dashboards                             | PASS   | 47 found                             |
-| Monitors / Alerts                      | PASS   | 123 found                            |
-| Log Pipelines                          | PASS   | 8 found                              |
-| Downtimes                              | FAIL   | Permission denied - missing scope (403) |
-| Usage: Audit Trail (audit_trail_read)  | WARN   | Missing scope - --usage will be empty |
-+----------------------------------------+--------+--------------------------------------+
-  1 FAILED, 1 warnings, 13 passed.
-  Fix FAIL items before running a full export.
-```
-
-**How to read the results:**
-- **PASS** — This category will export data normally.
-- **FAIL** — A required scope is missing. Many DataDog API endpoints silently return empty results on a 403 rather than raising an error — the export will appear to succeed but that category's data will be absent. Fix all FAIL items before proceeding.
-- **WARN** — An optional scope is missing. WARN items only affect `--usage` analytics; the main export will complete normally.
+Run `--test-access` before every first export against a new organization. If any category shows FAIL, re-create the Application Key with the missing scopes before proceeding.
 
 ---
 

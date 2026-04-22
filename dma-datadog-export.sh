@@ -169,6 +169,7 @@ SKIP_SLOS=false
 SKIP_METRICS=false
 SKIP_USERS=false
 COLLECT_USAGE=false
+TEST_ACCESS=false
 
 # Progress tracking
 TOTAL_STEPS=0
@@ -223,8 +224,10 @@ log() {
     local message="$@"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-    # Write to log file
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    # Write to log file (skipped when LOG_FILE is not yet set, e.g. during --test-access)
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    fi
 
     # Print to console with color
     case "$level" in
@@ -1316,6 +1319,131 @@ create_archive() {
 }
 
 # =============================================================================
+# ACCESS TEST
+# =============================================================================
+
+# Probe a single endpoint; sets PROBE_CODE and PROBE_BODY globals.
+probe_endpoint() {
+    local endpoint="$1"
+    local url="${DATADOG_API_URL}${endpoint}"
+    local tmp
+    tmp=$(mktemp)
+    PROBE_CODE=$(curl -s -o "$tmp" -w "%{http_code}" \
+        -H "DD-API-KEY: ${DATADOG_API_KEY}" \
+        -H "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
+        -H "Content-Type: application/json" \
+        --max-time 15 \
+        "$url" 2>/dev/null)
+    PROBE_BODY=$(cat "$tmp")
+    rm -f "$tmp"
+}
+
+# Classify HTTP code + body into PASS / WARN / FAIL.
+# $1 = http code, $2 = response body, $3 = jq expression returning item count
+classify_probe() {
+    local code="$1" body="$2" jq_expr="$3"
+    case "$code" in
+        200|201)
+            local count
+            count=$(echo "$body" | jq "$jq_expr" 2>/dev/null)
+            if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]; then
+                echo "PASS"
+            else
+                echo "WARN"
+            fi
+            ;;
+        401|403) echo "FAIL" ;;
+        404)     echo "WARN" ;;
+        *)       echo "FAIL" ;;
+    esac
+}
+
+run_test_access() {
+    echo ""
+    print_header "DataDog Access Test"
+    echo ""
+    print_color "$CYAN" "  Testing credentials and API permissions for: $DATADOG_API_URL"
+    echo ""
+
+    local sep="  +----------------------------------+---------+------+----------------------------+"
+    local hfmt="  | %-32s | %-7s | %-4s | %-26s |"
+    local rfmt="  | %-32s | %-7s | %-4s | %-26s |"
+
+    echo "$sep"
+    printf "$hfmt\n" "CATEGORY" "RESULT" "HTTP" "NOTES"
+    echo "$sep"
+
+    local pass_count=0 warn_count=0 fail_count=0
+
+    test_one() {
+        local label="$1" endpoint="$2" jq_expr="$3"
+
+        probe_endpoint "$endpoint"
+        local code="$PROBE_CODE" body="$PROBE_BODY"
+        local result notes=""
+
+        case "$code" in
+            000|"") result="FAIL"; notes="No response - check network" ;;
+            401|403) result="FAIL"; notes="Auth error - check key scopes" ;;
+            404)     result="WARN"; notes="Endpoint not found" ;;
+            200|201) result=$(classify_probe "$code" "$body" "$jq_expr") ;;
+            *)       result="FAIL"; notes="Unexpected HTTP $code" ;;
+        esac
+
+        if [[ "$result" == "WARN" ]] && [[ -z "$notes" ]]; then
+            notes="Scope ok; category may be empty"
+        fi
+
+        case "$result" in
+            PASS)
+                printf "${GREEN}${rfmt}${NC}\n" "$label" "PASS" "$code" "$notes"
+                pass_count=$((pass_count + 1))
+                ;;
+            WARN)
+                printf "${YELLOW}${rfmt}${NC}\n" "$label" "WARN" "$code" "$notes"
+                warn_count=$((warn_count + 1))
+                ;;
+            FAIL)
+                printf "${RED}${rfmt}${NC}\n" "$label" "FAIL" "$code" "$notes"
+                fail_count=$((fail_count + 1))
+                ;;
+        esac
+    }
+
+    test_one "Credentials"              "/api/v1/validate"                            "if .valid then 1 else 0 end"
+    test_one "Organization"             "/api/v1/org"                                 ".org | if . then 1 else 0 end"
+    test_one "Dashboards"               "/api/v1/dashboard"                           ".dashboards | length"
+    test_one "Monitors"                 "/api/v1/monitor?page_size=1"                 "length"
+    test_one "Log Pipelines"            "/api/v1/logs/config/pipelines"               "length"
+    test_one "Log Indexes"              "/api/v1/logs/config/indexes"                 ".indexes | length"
+    test_one "Synthetic Tests"          "/api/v1/synthetics/tests?page_size=1"        ".tests | length"
+    test_one "SLOs"                     "/api/v1/slo?limit=1"                         ".data | length"
+    test_one "Downtimes"                "/api/v2/downtime?page%5Blimit%5D=1"          ".data | length"
+    test_one "Metrics"                  "/api/v1/metrics?q=avg:*"                     ".metrics | length"
+    test_one "Webhooks"                 "/api/v1/integration/webhooks"                ".webhooks | length"
+    test_one "Users"                    "/api/v2/users?page%5Bsize%5D=1"             ".data | length"
+    test_one "Roles"                    "/api/v2/roles?page%5Bsize%5D=1"             ".data | length"
+    test_one "Teams"                    "/api/v2/teams?page%5Bsize%5D=1"             ".data | length"
+    test_one "Audit Trail (analytics)"  "/api/v2/audit/events?page%5Blimit%5D=1"     ".data | length"
+    test_one "Usage Metering (analytics)" "/api/v1/usage/logs_by_index?start_hr=2024-01-01T00&end_hr=2024-01-02T00" ".usage | length"
+
+    echo "$sep"
+    printf "  | %-32s   ${GREEN}PASS: %-3s${NC}   ${YELLOW}WARN: %-3s${NC}   ${RED}FAIL: %-3s${NC} |\n" \
+           "SUMMARY" "$pass_count" "$warn_count" "$fail_count"
+    echo "$sep"
+    echo ""
+
+    if [[ $fail_count -gt 0 ]]; then
+        print_color "$RED" "  One or more categories FAILED. Fix Application Key scopes before running a full export."
+    elif [[ $warn_count -gt 0 ]]; then
+        print_color "$YELLOW" "  All categories accessible. WARN may indicate empty categories or optional scopes."
+    else
+        print_color "$GREEN" "  All checks passed. Ready to run a full export."
+    fi
+    echo ""
+}
+
+# =============================================================================
 # COMMAND LINE ARGUMENT PARSING
 # =============================================================================
 
@@ -1352,6 +1480,8 @@ ${BOLD}SKIP OPTIONS:${NC}
     --usage-period PERIOD  Usage lookback period (default: 90d). Implies --usage
 
 ${BOLD}OTHER:${NC}
+    --test-access          Test credentials and scope for all export categories, then exit.
+                           No data is written. Run this before every first export.
     --debug                Enable debug logging
     --help                 Show this help message
 
@@ -1448,6 +1578,10 @@ parse_arguments() {
                 USAGE_PERIOD="$2"
                 shift 2
                 ;;
+            --test-access)
+                TEST_ACCESS=true
+                shift
+                ;;
             --debug)
                 DEBUG=true
                 shift
@@ -1522,6 +1656,15 @@ main() {
         exit 1
     fi
 
+    # Set API URL (needed for both test-access and full export)
+    DATADOG_API_URL=$(get_api_url)
+
+    # Handle --test-access: probe all endpoints and exit without writing any files
+    if [[ "$TEST_ACCESS" == "true" ]]; then
+        run_test_access
+        exit $?
+    fi
+
     # Set up export directory
     TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
     if [[ -z "$EXPORT_DIR" ]]; then
@@ -1536,9 +1679,6 @@ main() {
 
     # Create export directory
     mkdir -p "$OUTPUT_DIR"
-
-    # Set API URL
-    DATADOG_API_URL=$(get_api_url)
 
     # Initialize log file
     START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
