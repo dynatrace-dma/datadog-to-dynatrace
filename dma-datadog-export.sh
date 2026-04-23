@@ -145,8 +145,9 @@ BOX_B="╣"
 # DataDog connection
 DATADOG_API_KEY=""
 DATADOG_APP_KEY=""
-DATADOG_SITE="us1"          # default: US1
+DATADOG_SITE="app"          # default: app (US1)
 DATADOG_API_URL=""          # Will be set based on site
+SITE_EXPLICITLY_SET=false
 CUSTOM_API_URL=""           # For mock API testing
 
 # Export settings
@@ -310,24 +311,12 @@ get_api_url() {
     fi
 
     case "$DATADOG_SITE" in
-        us1)
-            echo "https://api.datadoghq.com"
-            ;;
-        us3)
-            echo "https://api.us3.datadoghq.com"
-            ;;
-        us5)
-            echo "https://api.us5.datadoghq.com"
-            ;;
-        eu)
-            echo "https://api.datadoghq.eu"
-            ;;
-        ap1)
-            echo "https://api.ap1.datadoghq.com"
-            ;;
-        *)
-            echo "https://api.datadoghq.com"
-            ;;
+        app|us1) echo "https://api.datadoghq.com" ;;
+        us3)     echo "https://api.us3.datadoghq.com" ;;
+        us5)     echo "https://api.us5.datadoghq.com" ;;
+        eu)      echo "https://api.datadoghq.eu" ;;
+        ap1)     echo "https://api.ap1.datadoghq.com" ;;
+        *)       echo "https://api.${DATADOG_SITE}.datadoghq.com" ;;
     esac
 }
 
@@ -1460,8 +1449,10 @@ ${BOLD}REQUIRED OPTIONS:${NC}
     --app-key KEY          DataDog Application Key (DD-APPLICATION-KEY)
 
 ${BOLD}OPTIONAL:${NC}
-    --site SITE            DataDog site/region (default: us1)
-                           Options: us1, us3, us5, eu, ap1
+    --site SITE            DataDog site identifier (default: app)
+                           Examples: app (default), us1, us3, us5, eu, hxp, hx-eu, etc.
+                           Any value is accepted. Unknown values are mapped to
+                           https://api.{site}.datadoghq.com
     --custom-url URL       Custom API URL (for testing with mock API)
     --output DIR           Export directory (default: ./datadog-export)
     --name NAME            Export name (default: datadog-export-TIMESTAMP)
@@ -1504,12 +1495,13 @@ ${BOLD}EXAMPLES:${NC}
     # Test with mock API
     $0 --api-key "test" --app-key "test" --custom-url "http://localhost:3000"
 
-${BOLD}DATADOG SITES:${NC}
-    us1 - https://api.datadoghq.com (default)
-    us3 - https://api.us3.datadoghq.com
-    us5 - https://api.us5.datadoghq.com
-    eu  - https://api.datadoghq.eu
-    ap1 - https://api.ap1.datadoghq.com
+${BOLD}KNOWN SITE MAPPINGS:${NC}
+    app / us1 - https://api.datadoghq.com (default)
+    us3       - https://api.us3.datadoghq.com
+    us5       - https://api.us5.datadoghq.com
+    eu        - https://api.datadoghq.eu
+    ap1       - https://api.ap1.datadoghq.com
+    <other>   - https://api.{site}.datadoghq.com
 
 EOF
 }
@@ -1527,6 +1519,7 @@ parse_arguments() {
                 ;;
             --site)
                 DATADOG_SITE="$2"
+                SITE_EXPLICITLY_SET=true
                 shift 2
                 ;;
             --custom-url)
@@ -1616,14 +1609,12 @@ prompt_for_credentials() {
         read -p "$(print_color $CYAN 'Enter DataDog Application Key: ')" DATADOG_APP_KEY
     fi
 
-    if [[ -z "$CUSTOM_API_URL" ]]; then
-        if [[ -z "$DATADOG_SITE" ]] || [[ "$DATADOG_SITE" == "us1" ]]; then
-            echo ""
-            print_color "$CYAN" "DataDog Site/Region (default: us1)"
-            print_color "$GRAY" "  Options: us1, us3, us5, eu, ap1, custom"
-            read -p "$(print_color $CYAN 'Site [us1]: ')" site_input
-            DATADOG_SITE="${site_input:-us1}"
-        fi
+    if [[ -z "$CUSTOM_API_URL" ]] && [[ "$SITE_EXPLICITLY_SET" != "true" ]]; then
+        echo ""
+        print_color "$CYAN" "DataDog Site/Region (default: app)"
+        print_color "$GRAY" "  Examples: app (default), us1, us3, us5, eu, hxp, hx-eu, etc."
+        read -p "$(print_color $CYAN 'Site [app]: ')" site_input
+        DATADOG_SITE="${site_input:-app}"
     fi
 }
 

@@ -20,7 +20,8 @@
     DataDog Application Key (DD-APPLICATION-KEY). Required.
 
 .PARAMETER Site
-    DataDog site/region. Options: us1, us3, us5, eu, ap1. Default: us1.
+    DataDog site identifier. Default: app. Examples: app, us1, us3, us5, eu, hxp, hx-eu, etc.
+    Any value is accepted; unknown sites are mapped to https://api.{site}.datadoghq.com.
 
 .PARAMETER CustomUrl
     Custom API base URL (for testing with a mock API).
@@ -93,7 +94,7 @@
 param(
     [string]$ApiKey       = "",
     [string]$AppKey       = "",
-    [string]$Site         = "us1",
+    [string]$Site         = "app",
     [string]$CustomUrl    = "",
     [string]$Output       = "",
     [string]$Name         = "",
@@ -122,6 +123,7 @@ $script:ScriptName        = "DMA DataDog Export"
 $script:DatadogApiKey     = $ApiKey
 $script:DatadogAppKey     = $AppKey
 $script:DatadogSite       = $Site
+$script:SiteExplicitlySet = $PSBoundParameters.ContainsKey('Site')
 $script:DatadogApiUrl     = ""
 $script:CustomApiUrl      = $CustomUrl
 
@@ -217,11 +219,13 @@ function Write-JsonObject {
 function Get-DataDogApiUrl {
     if ($script:CustomApiUrl) { return $script:CustomApiUrl }
     switch ($script:DatadogSite) {
+        'app' { return 'https://api.datadoghq.com' }
+        'us1' { return 'https://api.datadoghq.com' }
         'us3' { return 'https://api.us3.datadoghq.com' }
         'us5' { return 'https://api.us5.datadoghq.com' }
         'eu'  { return 'https://api.datadoghq.eu' }
         'ap1' { return 'https://api.ap1.datadoghq.com' }
-        default { return 'https://api.datadoghq.com' }
+        default { return "https://api.$($script:DatadogSite).datadoghq.com" }
     }
 }
 
@@ -1113,12 +1117,12 @@ function Read-Credentials {
         Write-Host "DataDog Application Key not provided via command line" -ForegroundColor Yellow
         $script:DatadogAppKey = Read-Host "Enter DataDog Application Key"
     }
-    if (-not $script:CustomApiUrl -and $script:DatadogSite -eq "us1") {
+    if (-not $script:CustomApiUrl -and -not $script:SiteExplicitlySet) {
         Write-Host ""
-        Write-Host "DataDog Site/Region (default: us1)" -ForegroundColor Cyan
-        Write-Host "  Options: us1, us3, us5, eu, ap1" -ForegroundColor DarkGray
-        $input = Read-Host "Site [us1]"
-        if ($input) { $script:DatadogSite = $input }
+        Write-Host "DataDog Site/Region (default: app)" -ForegroundColor Cyan
+        Write-Host "  Examples: app (default), us1, us3, us5, eu, hxp, hx-eu, etc." -ForegroundColor DarkGray
+        $siteInput = Read-Host "Site [app]"
+        if ($siteInput) { $script:DatadogSite = $siteInput }
     }
 }
 
