@@ -310,14 +310,34 @@ get_api_url() {
         return
     fi
 
-    case "$DATADOG_SITE" in
-        app|us1) echo "https://api.datadoghq.com" ;;
-        us3)     echo "https://api.us3.datadoghq.com" ;;
-        us5)     echo "https://api.us5.datadoghq.com" ;;
-        eu)      echo "https://api.datadoghq.eu" ;;
-        ap1)     echo "https://api.ap1.datadoghq.com" ;;
-        *)       echo "https://api.${DATADOG_SITE}.datadoghq.com" ;;
+    local site="$DATADOG_SITE"
+
+    # Short-code aliases (backwards compat)
+    case "$site" in
+        app|us1) site="datadoghq.com" ;;
+        us3)     site="us3.datadoghq.com" ;;
+        us5)     site="us5.datadoghq.com" ;;
+        eu)      site="datadoghq.eu" ;;
+        ap1)     site="ap1.datadoghq.com" ;;
     esac
+
+    # If a full URL was passed, strip the protocol
+    if [[ "$site" == *"://"* ]]; then
+        site="${site#*://}"
+        site="${site%/}"
+    fi
+
+    # If value contains a dot, it's a domain — strip 'app.' prefix and build API URL
+    if [[ "$site" == *"."* ]]; then
+        site="${site#app.}"
+        echo "https://api.$site"
+        return
+    fi
+
+    # Unknown short code — warn the user; dedicated orgs on US1 should use --site app
+    print_color "$YELLOW" "WARNING: Unknown site identifier '${DATADOG_SITE}'. Known codes: app/us1, us3, us5, eu, ap1."
+    print_color "$YELLOW" "WARNING: If this is a dedicated org on US1 infrastructure, use --site app instead. Use --custom-url to set an explicit API URL."
+    echo "https://api.${site}.datadoghq.com"
 }
 
 # Make authenticated API call to DataDog
@@ -1449,10 +1469,12 @@ ${BOLD}REQUIRED OPTIONS:${NC}
     --app-key KEY          DataDog Application Key (DD-APPLICATION-KEY)
 
 ${BOLD}OPTIONAL:${NC}
-    --site SITE            DataDog site identifier (default: app)
-                           Examples: app (default), us1, us3, us5, eu, hxp, hx-eu, etc.
-                           Any value is accepted. Unknown values are mapped to
-                           https://api.{site}.datadoghq.com
+    --site SITE            DataDog site identifier (default: app, equivalent to us1)
+                           Accepts a short code, domain, or full app URL:
+                             Short code: app / us1 (default), us3, us5, eu, ap1
+                             Domain:     hxp.datadoghq.com, hx-eu.datadoghq.eu
+                             Full URL:   https://app.datadoghq.com
+                                         https://hx-eu.datadoghq.eu
     --custom-url URL       Custom API URL (for testing with mock API)
     --output DIR           Export directory (default: ./datadog-export)
     --name NAME            Export name (default: datadog-export-TIMESTAMP)
@@ -1495,13 +1517,18 @@ ${BOLD}EXAMPLES:${NC}
     # Test with mock API
     $0 --api-key "test" --app-key "test" --custom-url "http://localhost:3000"
 
-${BOLD}KNOWN SITE MAPPINGS:${NC}
-    app / us1 - https://api.datadoghq.com (default)
-    us3       - https://api.us3.datadoghq.com
-    us5       - https://api.us5.datadoghq.com
-    eu        - https://api.datadoghq.eu
-    ap1       - https://api.ap1.datadoghq.com
-    <other>   - https://api.{site}.datadoghq.com
+${BOLD}SITE IDENTIFIER FORMATS:${NC}
+    Short codes (backwards compatible):
+      app / us1 → https://api.datadoghq.com (default)
+      us3       → https://api.us3.datadoghq.com
+      us5       → https://api.us5.datadoghq.com
+      eu        → https://api.datadoghq.eu
+      ap1       → https://api.ap1.datadoghq.com
+
+    Domain or full URL (recommended for dedicated clusters):
+      hxp.datadoghq.com         → https://api.hxp.datadoghq.com
+      hx-eu.datadoghq.eu        → https://api.hx-eu.datadoghq.eu
+      https://hx-eu.datadoghq.eu  (same result — URL is parsed automatically)
 
 EOF
 }
@@ -1611,8 +1638,10 @@ prompt_for_credentials() {
 
     if [[ -z "$CUSTOM_API_URL" ]] && [[ "$SITE_EXPLICITLY_SET" != "true" ]]; then
         echo ""
-        print_color "$CYAN" "DataDog Site/Region (default: app)"
-        print_color "$GRAY" "  Examples: app (default), us1, us3, us5, eu, hxp, hx-eu, etc."
+        print_color "$CYAN" "DataDog Site (default: app, equivalent to us1)"
+        print_color "$GRAY" "  Paste your DataDog app URL or enter a site identifier:"
+        print_color "$GRAY" "  URL:        https://app.datadoghq.com  or  https://hx-eu.datadoghq.eu"
+        print_color "$GRAY" "  Short code: app / us1 (default), us3, us5, eu, ap1"
         read -p "$(print_color $CYAN 'Site [app]: ')" site_input
         DATADOG_SITE="${site_input:-app}"
     fi

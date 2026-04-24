@@ -20,8 +20,9 @@
     DataDog Application Key (DD-APPLICATION-KEY). Required.
 
 .PARAMETER Site
-    DataDog site identifier. Default: app. Examples: app, us1, us3, us5, eu, hxp, hx-eu, etc.
-    Any value is accepted; unknown sites are mapped to https://api.{site}.datadoghq.com.
+    DataDog site identifier. Default: app (equivalent to us1).
+    Accepts a short code (app/us1, us3, us5, eu, ap1), a site domain (hxp.datadoghq.com,
+    hx-eu.datadoghq.eu), or a full app URL (https://app.datadoghq.com, https://hx-eu.datadoghq.eu).
 
 .PARAMETER CustomUrl
     Custom API base URL (for testing with a mock API).
@@ -67,6 +68,10 @@
 .PARAMETER DebugMode
     Enable verbose debug logging.
 
+.PARAMETER SkipCertCheck
+    Disable SSL certificate validation. Use for dedicated clusters whose certificate
+    is not trusted by Windows (e.g. corporate CA or hostname mismatch). Use with care.
+
 .PARAMETER ShowHelp
     Show this help message and exit.
 
@@ -110,6 +115,7 @@ param(
     [switch]$NonInteractive,
     [switch]$DebugMode,
     [switch]$TestAccess,
+    [switch]$SkipCertCheck,
     [switch]$ShowHelp
 )
 
@@ -132,6 +138,23 @@ $script:ExportName        = $Name
 $script:Timestamp         = ""
 $script:LogFile           = ""
 $script:OutputDir         = ""
+
+# PS 5.1 defaults to TLS 1.0/1.1; dedicated DataDog clusters require TLS 1.2+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+if ($SkipCertCheck) {
+    Add-Type -TypeDefinition @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class DmaTrustAllCerts : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint sp, X509Certificate cert,
+        WebRequest req, int problem) { return true; }
+}
+"@
+    [Net.ServicePointManager]::CertificatePolicy = New-Object DmaTrustAllCerts
+    Write-Warning "SSL certificate validation is disabled (-SkipCertCheck). Use only on trusted networks."
+}
 
 $script:OrgName           = ""
 $script:OrgId             = ""
@@ -218,15 +241,34 @@ function Write-JsonObject {
 
 function Get-DataDogApiUrl {
     if ($script:CustomApiUrl) { return $script:CustomApiUrl }
-    switch ($script:DatadogSite) {
-        'app' { return 'https://api.datadoghq.com' }
-        'us1' { return 'https://api.datadoghq.com' }
-        'us3' { return 'https://api.us3.datadoghq.com' }
-        'us5' { return 'https://api.us5.datadoghq.com' }
-        'eu'  { return 'https://api.datadoghq.eu' }
-        'ap1' { return 'https://api.ap1.datadoghq.com' }
-        default { return "https://api.$($script:DatadogSite).datadoghq.com" }
+
+    $site = $script:DatadogSite
+
+    # Short-code aliases (backwards compat)
+    switch ($site) {
+        'app' { $site = 'datadoghq.com' }
+        'us1' { $site = 'datadoghq.com' }
+        'us3' { $site = 'us3.datadoghq.com' }
+        'us5' { $site = 'us5.datadoghq.com' }
+        'eu'  { $site = 'datadoghq.eu' }
+        'ap1' { $site = 'ap1.datadoghq.com' }
     }
+
+    # If a full URL was passed, extract the domain
+    if ($site -match '://') {
+        $site = ($site -replace '^https?://', '').TrimEnd('/')
+    }
+
+    # If value contains a dot, it's a domain — strip 'app.' prefix and build API URL
+    if ($site -match '\.') {
+        $site = $site -replace '^app\.', ''
+        return "https://api.$site"
+    }
+
+    # Unknown short code — warn the user; dedicated orgs on US1 should use -Site app
+    Write-Warning "Unknown site identifier '$($script:DatadogSite)'. Known codes: app/us1, us3, us5, eu, ap1."
+    Write-Warning "If this is a dedicated org on US1 infrastructure, use -Site app instead. Use -CustomUrl to set an explicit API URL."
+    return "https://api.$site.datadoghq.com"
 }
 
 function Invoke-DataDogApi {
@@ -252,13 +294,10 @@ function Invoke-DataDogApi {
     $retryDelay = 5
 
     while ($retryCount -lt $maxRetries) {
+        $response = $null
         try {
             $response = Invoke-WebRequest -Uri $url -Method $Method -Headers $headers `
                 -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
-            $script:SuccessfulApiCalls++
-            if ($OutputFile) { Write-JsonFile -Path $OutputFile -Content $response.Content }
-            Write-Log DEBUG "API call successful: $($response.StatusCode)"
-            return $response.Content | ConvertFrom-Json
         }
         catch {
             $statusCode = 0
@@ -269,6 +308,7 @@ function Invoke-DataDogApi {
                 $wait = $retryDelay * $retryCount
                 Write-Log WARNING "Rate limited (429). Retry $retryCount/$maxRetries after ${wait}s..."
                 Start-Sleep -Seconds $wait
+                continue
             }
             elseif ($statusCode -in @(401, 403)) {
                 $script:FailedApiCalls++
@@ -284,13 +324,20 @@ function Invoke-DataDogApi {
                 $retryCount++
                 Write-Log WARNING "Server error ($statusCode). Retry $retryCount/$maxRetries..."
                 Start-Sleep -Seconds $retryDelay
+                continue
             }
             else {
                 $script:FailedApiCalls++
-                Write-Log ERROR "API call failed ($statusCode) for: $Endpoint"
-                Write-Log DEBUG $_.Exception.Message
+                Write-Log ERROR "Network error ($statusCode) for: $Endpoint - $($_.Exception.Message)"
                 return $null
             }
+        }
+
+        if ($response) {
+            $script:SuccessfulApiCalls++
+            Write-Log DEBUG "API call successful: $($response.StatusCode)"
+            if ($OutputFile) { Write-JsonFile -Path $OutputFile -Content $response.Content }
+            return $response.Content | ConvertFrom-Json
         }
     }
 
@@ -1119,8 +1166,10 @@ function Read-Credentials {
     }
     if (-not $script:CustomApiUrl -and -not $script:SiteExplicitlySet) {
         Write-Host ""
-        Write-Host "DataDog Site/Region (default: app)" -ForegroundColor Cyan
-        Write-Host "  Examples: app (default), us1, us3, us5, eu, hxp, hx-eu, etc." -ForegroundColor DarkGray
+        Write-Host "DataDog Site (default: app, equivalent to us1)" -ForegroundColor Cyan
+        Write-Host "  Paste your DataDog app URL or enter a site identifier:" -ForegroundColor DarkGray
+        Write-Host "  URL:        https://app.datadoghq.com  or  https://hx-eu.datadoghq.eu" -ForegroundColor DarkGray
+        Write-Host "  Short code: app / us1 (default), us3, us5, eu, ap1" -ForegroundColor DarkGray
         $siteInput = Read-Host "Site [app]"
         if ($siteInput) { $script:DatadogSite = $siteInput }
     }
@@ -1162,8 +1211,30 @@ function Main {
     $script:Timestamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     if (-not $script:ExportDir)  { $script:ExportDir  = ".\datadog-export" }
     if (-not $script:ExportName) { $script:ExportName = "datadog-export-$($script:Timestamp)" }
-    $script:OutputDir  = Join-Path $script:ExportDir $script:ExportName
-    $script:LogFile    = Join-Path $script:OutputDir "export.log"
+
+    $resolvedExportDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:ExportDir)
+    if (-not (Test-Path $resolvedExportDir -PathType Container)) {
+        if ($NonInteractive) {
+            New-Item -ItemType Directory -Path $resolvedExportDir -Force | Out-Null
+            Write-Log SUCCESS "Created output directory: $resolvedExportDir"
+        } else {
+            Write-Host ""
+            Write-Host "  Output directory does not exist:" -ForegroundColor Yellow
+            Write-Host "  $resolvedExportDir" -ForegroundColor Yellow
+            $answer = Read-Host "  Create it? [Y/n]"
+            if ($answer -eq '' -or $answer -match '^[Yy]') {
+                New-Item -ItemType Directory -Path $resolvedExportDir -Force | Out-Null
+                Write-Log SUCCESS "Created output directory: $resolvedExportDir"
+            } else {
+                Write-Log ERROR "Output directory does not exist. Aborting."
+                exit 1
+            }
+        }
+    }
+
+    $script:ExportDir = $resolvedExportDir
+    $script:OutputDir = Join-Path $script:ExportDir $script:ExportName
+    $script:LogFile   = Join-Path $script:OutputDir "export.log"
 
     New-Item -ItemType Directory -Path $script:OutputDir -Force | Out-Null
     $script:StartTime     = Get-Date

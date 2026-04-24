@@ -10,7 +10,14 @@
 
 ## Overview
 
-`dma-datadog-export.sh` extracts configuration, dashboards, monitors, SLOs, synthetic tests, log pipelines, and usage analytics from a DataDog SaaS environment via REST API. The export archive powers the **Dynatrace Migration Assistant (DMA)** — feeding the **DMA Curator Server** for migration planning, reporting, and DataDog-to-Dynatrace conversion workflows.
+Two export scripts are provided — choose the one that matches your environment:
+
+| Script | Platform | Requirements |
+|--------|----------|--------------|
+| `dma-datadog-export.sh` | Linux, macOS, WSL | bash, curl, jq, tar |
+| `dma-datadog-export.ps1` | Windows (PowerShell 5.1+) | tar.exe (Windows 10 build 1803+) |
+
+Both scripts produce identical output archives and are feature-equivalent. The bash script is preferred on Linux/macOS; the PowerShell script is preferred on Windows.
 
 > **DataDog SaaS only.** DataDog does not offer self-hosted versions, so there is no on-premises variant of this script.
 
@@ -19,6 +26,8 @@
 ## Before You Begin
 
 ### Prerequisites
+
+**Bash script (`dma-datadog-export.sh`)**
 
 | Requirement | Detail |
 |-------------|--------|
@@ -30,9 +39,19 @@
 | **Network** | HTTPS access to your DataDog API endpoint (see regions below) |
 | **Disk space** | 500 MB+ free in the working directory |
 
+**PowerShell script (`dma-datadog-export.ps1`)**
+
+| Requirement | Detail |
+|-------------|--------|
+| **Platform** | Windows 10 build 1803+ or Windows Server 2019+ |
+| **PowerShell** | 5.1+ (Windows PowerShell, pre-installed on Windows 10/11) |
+| **tar.exe** | Built into Windows 10 build 1803+; verify with `tar --version` in PowerShell |
+| **Network** | HTTPS access to your DataDog API endpoint (see regions below) |
+| **Disk space** | 500 MB+ free in the working directory |
+
 ### Where to Run
 
-The script runs from **any machine with internet access** to the DataDog API — your laptop, a jump host, a CI/CD runner. No access to DataDog infrastructure is required.
+Both scripts run from **any machine with internet access** to the DataDog API — your laptop, a jump host, a CI/CD runner. No access to DataDog infrastructure is required.
 
 ### CRLF Line Endings (Windows)
 
@@ -125,18 +144,32 @@ Example output:
 
 ## DataDog Regions
 
-Choose the API endpoint that matches your DataDog organization:
+### Known Regions
 
-| Site | API URL | `--site` flag |
-|------|---------|---------------|
-| US1 (default) | `https://api.datadoghq.com` | `us1` |
+| Site | API URL | `--site` value |
+|------|---------|----------------|
+| US1 (default) | `https://api.datadoghq.com` | `app` or `us1` |
 | US3 | `https://api.us3.datadoghq.com` | `us3` |
 | US5 | `https://api.us5.datadoghq.com` | `us5` |
 | EU | `https://api.datadoghq.eu` | `eu` |
 | AP1 | `https://api.ap1.datadoghq.com` | `ap1` |
 | Custom / Mock | Any URL | `--custom-url URL` |
 
-If you do not know your region, log into the DataDog UI and check the URL in your browser — the subdomain identifies the site.
+### Dedicated Clusters
+
+The `--site` flag accepts three formats, which is useful for dedicated DataDog clusters:
+
+| Format | Example | When to use |
+|--------|---------|-------------|
+| Short code | `app`, `eu`, `ap1` | Standard regions (see table above) |
+| Site domain | `hx-eu.datadoghq.eu` | Dedicated cluster with known domain |
+| Full app URL | `https://hx-eu.datadoghq.eu` | Paste directly from browser address bar |
+
+The API URL is derived automatically: `https://app.hx-eu.datadoghq.eu` → strip `app.` → `https://api.hx-eu.datadoghq.eu`.
+
+> **Dedicated orgs on US1:** Some DataDog dedicated instances are isolated organizations on the shared US1 infrastructure rather than separate clusters. If your browser shows a custom domain (e.g., `hxp.datadoghq.com`) but `--site hxp` fails to connect, use `--site app` instead — the API is at the standard `https://api.datadoghq.com` endpoint.
+
+If you do not know your region, log into the DataDog UI and check the URL in your browser.
 
 ---
 
@@ -286,6 +319,8 @@ Provide all parameters on the command line — suitable for automation and CI/CD
 |------|------------|-------------|
 | `--test-access` | `-TestAccess` | Test credentials and permissions for all export categories, then exit. No data is written. Run this before every first export. |
 | `--debug` | `-DebugMode` | Enable verbose debug logging to console and log file |
+| `--non-interactive` | `-NonInteractive` | Skip all interactive prompts. Requires `--api-key` and `--app-key`. |
+| *(n/a)* | `-SkipCertCheck` | **PowerShell only.** Disable SSL certificate validation. Use when connecting to a dedicated cluster whose certificate is not trusted by the Windows certificate store. Use only on trusted networks. |
 | `--help` | `-ShowHelp` | Show help and exit |
 
 ---
@@ -381,8 +416,14 @@ The DataDog API enforces per-endpoint rate limits. The script handles this autom
 | Export completes but DMA shows no dashboards | Application Key missing `dashboards_read` scope | Re-create the Application Key with all required scopes |
 | Export completes but analytics tab is empty | Application Key missing `audit_trail_read` or `usage_read` | Add both scopes to the Application Key, re-run with `--usage` |
 | `Authentication failed (403)` during export | Wrong API Key or Application Key value | Verify both keys in DataDog Organization Settings; re-generate if needed |
+| `Credentials (validate): PASS` but all exports fail | Application Key is wrong — `/api/v1/validate` checks only the API Key | Verify the Application Key separately; the validate endpoint does not check it |
 | `curl: (6) Could not resolve host` | Wrong `--site` value, or no internet access | Confirm the correct region and test with the connectivity check command above |
 | `000` from connectivity test | Firewall or proxy blocking HTTPS to DataDog | Check outbound HTTPS rules; if behind a proxy, set `https_proxy` in your environment |
+| `No response` for a dedicated cluster site | Dedicated org on US1 infrastructure — no separate cluster API | Use `--site app` instead; the API is at `https://api.datadoghq.com` |
+| `No response` after `--site` with unknown short code | Warning is printed; constructed URL may not exist | Pass the full app URL or domain instead: `--site hx-eu.datadoghq.eu` |
+| **PowerShell:** `No response` for a known dedicated cluster | TLS certificate not trusted by Windows certificate store | Add `-SkipCertCheck` to the PowerShell command — use only on trusted networks |
+| **PowerShell:** `API call failed (0)` for all endpoints | File write error masked as API failure (pre-2.0.1) | Upgrade to the current version; the actual error is now shown |
+| **PowerShell:** Output goes to wrong location | Relative `--output` path (e.g., `../folder`) resolved by .NET against `C:\Windows\` | Fixed in 2.0.1 — relative paths are now resolved against PowerShell's working directory |
 | `jq: command not found` | `jq` not installed | `brew install jq` (macOS) or `apt-get install jq` (Linux) |
 | `$'\r': command not found` | Windows CRLF line endings | Run the script once — it auto-converts itself and re-executes |
 | Archive not created at end | `tar` failed — usually disk space | Ensure 500 MB+ free; use `--output` to point to a partition with more space |
@@ -415,6 +456,17 @@ The `manifest.json` embedded in the archive tells the DMA Server which script ve
 ---
 
 ## Release Notes
+
+### v2.0.1 — PowerShell improvements and site flexibility
+
+- **PowerShell script added** — `dma-datadog-export.ps1` provides feature parity with the bash script on Windows, with no external dependencies beyond `tar.exe` (built into Windows 10 build 1803+)
+- **Flexible `--site` / `-Site` parameter** — now accepts short codes (`app`, `us1`, `us3`, `us5`, `eu`, `ap1`), site domains (`hx-eu.datadoghq.eu`), or full app URLs (`https://hx-eu.datadoghq.eu`). The API URL is derived automatically. `app` is the default and is equivalent to `us1`
+- **Unknown site warning** — passing an unrecognised short code now prints a warning and suggests `--site app` for dedicated orgs on US1 infrastructure
+- **TLS 1.2 enforcement (PowerShell)** — PowerShell 5.1 defaults to TLS 1.0/1.1; the script now enforces TLS 1.2 explicitly to support dedicated cluster endpoints
+- **`-SkipCertCheck` (PowerShell)** — new switch to bypass SSL certificate validation for dedicated clusters whose certificate is not trusted by the Windows certificate store
+- **Output directory validation (PowerShell)** — if the target output directory does not exist, the script prompts to create it rather than failing silently mid-export
+- **Relative path fix (PowerShell)** — relative `--output` paths (e.g., `../Test/Hyland`) are now resolved against PowerShell's working directory instead of the .NET runtime directory (`C:\Windows\`)
+- **Improved error messages (PowerShell)** — network-level failures now report the actual exception message rather than `API call failed (0)`, making it easier to distinguish TLS errors, certificate failures, and connectivity problems
 
 ### v2.0.0 — REST API rewrite
 
