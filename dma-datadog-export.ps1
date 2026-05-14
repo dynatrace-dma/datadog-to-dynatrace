@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     DMA DataDog Export Script v2.0.0 (PowerShell)
@@ -829,7 +829,11 @@ function Invoke-AuditTrailQuery {
 
 function Collect-DashboardViews {
     Write-Log INFO "Collecting dashboard view analytics..."
-    $events  = Invoke-AuditTrailQuery '@type:audit @evt.name:"Dashboard Viewed"'
+    $failsBefore = $script:FailedApiCalls
+    $events  = Invoke-AuditTrailQuery '@evt.name:"Dashboard Viewed"'
+    if (@($events).Count -eq 0 -and $script:FailedApiCalls -gt $failsBefore) {
+        Write-Log WARNING "Dashboard views: 0 results - Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+    }
     $grouped = $events | Group-Object { $_.attributes.asset.id } | ForEach-Object {
         $g      = $_.Group
         $emails = @($g | ForEach-Object { $_.attributes.usr.email } | Sort-Object -Unique)
@@ -849,7 +853,11 @@ function Collect-DashboardViews {
 
 function Collect-MonitorTriggers {
     Write-Log INFO "Collecting monitor trigger analytics..."
-    $events  = Invoke-AuditTrailQuery '@type:audit @asset.type:monitor @evt.name:("Monitor Alert Triggered" OR "Monitor Resolved")'
+    $failsBefore = $script:FailedApiCalls
+    $events  = Invoke-AuditTrailQuery '@asset.type:monitor @evt.name:("Monitor Alert Triggered" OR "Monitor Resolved")'
+    if (@($events).Count -eq 0 -and $script:FailedApiCalls -gt $failsBefore) {
+        Write-Log WARNING "Monitor triggers: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+    }
     $grouped = $events | Group-Object { $_.attributes.asset.id } | ForEach-Object {
         $g        = $_.Group
         $triggers = @($g | Where-Object { $_.attributes.evt.name -eq 'Monitor Alert Triggered' }).Count
@@ -870,25 +878,42 @@ function Collect-MonitorTriggers {
 
 function Collect-LogIndexVolume {
     Write-Log INFO "Collecting log index volume analytics..."
-    $fromHr = (Get-UsageFromTimestamp).Substring(0, 13)
-    $toHr   = (Get-UsageToTimestamp).Substring(0, 13)
-    $data   = Invoke-DataDogApi -Method GET -Endpoint ('/api/v1/usage/logs_by_index?start_hr={0}&end_hr={1}' -f $fromHr, $toHr)
-    $outFile = Join-Path $script:OutputDir "analytics\log_index_volume.json"
+    # DataDog Usage Metering API allows at most ~1 month per request.
+    # Split the usage period into monthly windows and aggregate the results.
+    $fromDate = [datetime]::ParseExact((Get-UsageFromTimestamp).Substring(0, 10), 'yyyy-MM-dd', $null)
+    $toDate   = [datetime]::ParseExact((Get-UsageToTimestamp).Substring(0, 10),   'yyyy-MM-dd', $null)
+    $outFile  = Join-Path $script:OutputDir "analytics\log_index_volume.json"
+    $totals   = @{}
+    $anyData  = $false
 
-    if ($data -and $data.usage) {
-        $totals = @{}
-        foreach ($day in $data.usage) {
-            if (-not $day.by_index) { continue }
-            foreach ($entry in $day.by_index) {
-                $n = $entry.index_name
-                if (-not $totals.ContainsKey($n)) {
-                    $totals[$n] = @{ total_event_count = 0; total_retention_event_count = 0; days_active = 0 }
+    $windowStart = $fromDate
+    while ($windowStart -le $toDate) {
+        $windowEnd = $windowStart.AddMonths(1).AddDays(-1)
+        if ($windowEnd -gt $toDate) { $windowEnd = $toDate }
+
+        $startHr = $windowStart.ToString('yyyy-MM-ddT00')
+        $endHr   = $windowEnd.ToString('yyyy-MM-ddT23')
+
+        $data = Invoke-DataDogApi -Method GET -Endpoint ('/api/v1/usage/logs_by_index?start_hr={0}&end_hr={1}' -f $startHr, $endHr)
+        if ($data -and $data.usage) {
+            $anyData = $true
+            foreach ($day in $data.usage) {
+                if (-not $day.by_index) { continue }
+                foreach ($entry in $day.by_index) {
+                    $n = $entry.index_name
+                    if (-not $totals.ContainsKey($n)) {
+                        $totals[$n] = @{ total_event_count = 0; total_retention_event_count = 0; days_active = 0 }
+                    }
+                    $totals[$n].total_event_count           += if ($entry.event_count)           { $entry.event_count }           else { 0 }
+                    $totals[$n].total_retention_event_count += if ($entry.retention_event_count) { $entry.retention_event_count } else { 0 }
+                    $totals[$n].days_active++
                 }
-                $totals[$n].total_event_count           += if ($entry.event_count)           { $entry.event_count }           else { 0 }
-                $totals[$n].total_retention_event_count += if ($entry.retention_event_count) { $entry.retention_event_count } else { 0 }
-                $totals[$n].days_active++
             }
         }
+        $windowStart = $windowStart.AddMonths(1)
+    }
+
+    if ($anyData) {
         $indexes = $totals.GetEnumerator() | ForEach-Object {
             [PSCustomObject]@{
                 index_name                   = $_.Key
@@ -898,19 +923,23 @@ function Collect-LogIndexVolume {
             }
         } | Sort-Object -Property total_event_count -Descending
         Write-JsonObject -Path $outFile -Object ([PSCustomObject]@{
-            period  = @{ from = $fromHr; to = $toHr }
+            period  = @{ from = $fromDate.ToString('yyyy-MM-dd'); to = $toDate.ToString('yyyy-MM-dd') }
             indexes = @($indexes)
         })
         Write-Log SUCCESS "Log index volume: $(@($indexes).Count) indexes with usage data"
     } else {
         Write-JsonFile -Path $outFile -Content '{"indexes":[],"error":"Usage Metering API not available"}'
-        Write-Log WARNING "Log index volume: Usage Metering API not available (needs usage_read permission)"
+        Write-Log WARNING "Log index volume: no data returned - check that your Application Key has the 'usage_read' scope"
     }
 }
 
 function Collect-MonitorModifications {
     Write-Log INFO "Collecting monitor modification analytics..."
-    $events  = Invoke-AuditTrailQuery '@type:audit @asset.type:monitor @evt.name:("Monitor Created" OR "Monitor Modified")'
+    $failsBefore = $script:FailedApiCalls
+    $events  = Invoke-AuditTrailQuery '@asset.type:monitor @evt.name:("Monitor Created" OR "Monitor Modified")'
+    if (@($events).Count -eq 0 -and $script:FailedApiCalls -gt $failsBefore) {
+        Write-Log WARNING "Monitor modifications: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+    }
     $grouped = $events | Group-Object { $_.attributes.asset.id } | ForEach-Object {
         $g        = $_.Group
         $created  = @($g | Where-Object { $_.attributes.evt.name -eq 'Monitor Created' }).Count
@@ -939,7 +968,11 @@ function Collect-UnusedDashboards {
     $outFile = Join-Path $script:OutputDir "analytics\unused_dashboards.json"
 
     if ($allIds.Count -eq 0) {
-        Write-Log WARNING "No dashboards found to cross-reference"
+        if ($script:SkipDashboardsF) {
+            Write-Log INFO "Skipping unused-dashboard cross-reference (-SkipDashboards was set)"
+        } else {
+            Write-Log WARNING "No dashboard files found in $dashDir - dashboards may not have been exported in this run"
+        }
         Write-JsonFile -Path $outFile -Content '{"unused_dashboards":[],"total_dashboards":0,"unused_count":0}'
         return
     }
@@ -954,8 +987,8 @@ function Collect-UnusedDashboards {
     $unusedIds = @($allIds | Where-Object { $_ -notin $viewedIds })
     $unusedList = $unusedIds | ForEach-Object {
         $title = "Unknown"
-        $f = Join-Path $dashDir "dashboard-${_}.json"
-        if (Test-Path $f) { $d = Get-Content $f -Raw | ConvertFrom-Json; if ($d.title) { $title = $d.title } }
+        $f = Join-Path $script:OutputDir "dashboards\dashboard-${_}.json"
+        if ($f -and (Test-Path $f)) { $d = Get-Content $f -Raw | ConvertFrom-Json; if ($d.title) { $title = $d.title } }
         [PSCustomObject]@{ dashboard_id = $_; title = $title }
     }
     Write-JsonObject -Path $outFile -Object ([PSCustomObject]@{
@@ -976,7 +1009,11 @@ function Collect-UnusedMonitors {
     $outFile = Join-Path $script:OutputDir "analytics\unused_monitors.json"
 
     if ($allIds.Count -eq 0) {
-        Write-Log WARNING "No monitors found to cross-reference"
+        if ($script:SkipMonitorsF) {
+            Write-Log INFO "Skipping unused-monitor cross-reference (-SkipMonitors was set)"
+        } else {
+            Write-Log WARNING "No monitor files found in $monDir — monitors may not have been exported in this run"
+        }
         Write-JsonFile -Path $outFile -Content '{"unused_monitors":[],"total_monitors":0,"unused_count":0}'
         return
     }
@@ -991,8 +1028,8 @@ function Collect-UnusedMonitors {
     $unusedIds  = @($allIds | Where-Object { $_ -notin $triggeredIds })
     $unusedList = $unusedIds | ForEach-Object {
         $name = "Unknown"
-        $f = Join-Path $monDir "monitor-${_}.json"
-        if (Test-Path $f) { $m = Get-Content $f -Raw | ConvertFrom-Json; if ($m.name) { $name = $m.name } }
+        $f = Join-Path $script:OutputDir "monitors\monitor-${_}.json"
+        if ($f -and (Test-Path $f)) { $m = Get-Content $f -Raw | ConvertFrom-Json; if ($m.name) { $name = $m.name } }
         [PSCustomObject]@{ monitor_id = $_; name = $name }
     }
     Write-JsonObject -Path $outFile -Object ([PSCustomObject]@{
