@@ -977,7 +977,11 @@ audit_trail_query() {
 collect_dashboard_views() {
     log INFO "Collecting dashboard view analytics..."
     local raw_file=$(mktemp)
-    audit_trail_query "@type:audit @evt.name:\"Dashboard Viewed\"" "$raw_file"
+    local fails_before=$FAILED_API_CALLS
+    audit_trail_query "@evt.name:\"Dashboard Viewed\"" "$raw_file"
+    if [[ $(jq 'length' "$raw_file" 2>/dev/null) == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
+        log WARNING "Dashboard views: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+    fi
 
     # Aggregate: per-dashboard view count, unique users, last viewed
     jq '[group_by(.attributes.asset.id) | .[] | {
@@ -998,7 +1002,11 @@ collect_dashboard_views() {
 collect_monitor_triggers() {
     log INFO "Collecting monitor trigger analytics..."
     local raw_file=$(mktemp)
-    audit_trail_query "@type:audit @asset.type:monitor @evt.name:(\"Monitor Alert Triggered\" OR \"Monitor Resolved\")" "$raw_file"
+    local fails_before=$FAILED_API_CALLS
+    audit_trail_query "@asset.type:monitor @evt.name:(\"Monitor Alert Triggered\" OR \"Monitor Resolved\")" "$raw_file"
+    if [[ $(jq 'length' "$raw_file" 2>/dev/null) == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
+        log WARNING "Monitor triggers: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+    fi
 
     jq '[group_by(.attributes.asset.id) | .[] | {
         monitor_id: .[0].attributes.asset.id,
@@ -1017,36 +1025,86 @@ collect_monitor_triggers() {
 # ── Query 3: Log Index Volume ────────────────────────────────────────────────
 collect_log_index_volume() {
     log INFO "Collecting log index volume analytics..."
-    local from_hr=$(get_usage_from_timestamp | sed 's/T.*/T00/')
-    local to_hr=$(get_usage_to_timestamp | sed 's/T.*/T00/')
+    # DataDog Usage Metering API allows at most ~1 month per request; paginate monthly.
+    local from_date to_date
+    from_date=$(get_usage_from_timestamp | cut -c1-10)
+    to_date=$(get_usage_to_timestamp   | cut -c1-10)
+    local outfile="$OUTPUT_DIR/analytics/log_index_volume.json"
 
-    local temp_file=$(mktemp)
-    if dd_api_call "GET" "/api/v1/usage/logs_by_index?start_hr=${from_hr}&end_hr=${to_hr}" "$temp_file"; then
-        # Aggregate daily data into per-index totals
-        jq '{
-            period: { from: .'"'"'usage'"'"'[0].date // "unknown", to: .'"'"'usage'"'"'[-1].date // "unknown" },
-            indexes: [.usage // [] | [.[].by_index // []] | add // [] | group_by(.index_name) | .[] | {
-                index_name: .[0].index_name,
-                total_event_count: ([.[].event_count] | add),
-                total_retention_event_count: ([.[].retention_event_count // 0] | add),
-                days_active: length
-            }] | sort_by(-.total_event_count)
-        }' "$temp_file" > "$OUTPUT_DIR/analytics/log_index_volume.json" 2>/dev/null
+    local entries_file=$(mktemp)
+    echo '[]' > "$entries_file"
+    local any_data=false
 
-        local count=$(jq '.indexes | length' "$OUTPUT_DIR/analytics/log_index_volume.json" 2>/dev/null)
+    local current="$from_date"
+    while [[ "$current" <= "$to_date" ]]; do
+        # Compute end of this monthly window
+        local window_end
+        if date -v -1d >/dev/null 2>&1; then
+            # macOS BSD date
+            window_end=$(date -j -f '%Y-%m-%d' "$current" -v +1m -v -1d '+%Y-%m-%d' 2>/dev/null)
+        else
+            # GNU date (Linux)
+            window_end=$(date -u -d "$current +1 month -1 day" '+%Y-%m-%d' 2>/dev/null)
+        fi
+        [[ "$window_end" > "$to_date" ]] && window_end="$to_date"
+
+        local temp_file=$(mktemp)
+        if dd_api_call "GET" \
+            "/api/v1/usage/logs_by_index?start_hr=${current}T00&end_hr=${window_end}T23" \
+            "$temp_file"; then
+            any_data=true
+            # Flatten all per-day by_index entries from this window
+            local page_entries
+            page_entries=$(jq '[.usage // [] | .[] | (.by_index // []) | .[] |
+                {index_name, event_count: (.event_count // 0), retention_event_count: (.retention_event_count // 0)}]' \
+                "$temp_file" 2>/dev/null)
+            # Append to running list
+            jq -n --slurpfile a "$entries_file" --argjson b "$page_entries" '$a[0] + $b' \
+                > "${entries_file}.tmp" && mv "${entries_file}.tmp" "$entries_file"
+        fi
+        rm -f "$temp_file"
+
+        [[ "$window_end" == "$to_date" ]] && break
+        if date -v -1d >/dev/null 2>&1; then
+            current=$(date -j -f '%Y-%m-%d' "$current" -v +1m '+%Y-%m-%d' 2>/dev/null)
+        else
+            current=$(date -u -d "$current +1 month" '+%Y-%m-%d' 2>/dev/null)
+        fi
+        [[ "$current" > "$to_date" ]] && break
+    done
+
+    if [[ "$any_data" == "true" ]]; then
+        jq -n \
+            --arg from "$from_date" --arg to "$to_date" \
+            --slurpfile e "$entries_file" \
+            '{
+                period: {from: $from, to: $to},
+                indexes: [$e[0] | group_by(.index_name) | .[] | {
+                    index_name: .[0].index_name,
+                    total_event_count:            ([.[].event_count]            | add),
+                    total_retention_event_count:  ([.[].retention_event_count]  | add),
+                    days_active: length
+                }] | sort_by(-.total_event_count)
+            }' > "$outfile"
+        local count
+        count=$(jq '.indexes | length' "$outfile" 2>/dev/null)
         log SUCCESS "Log index volume: $count indexes with usage data"
     else
-        log WARNING "Log index volume: Usage Metering API not available (needs usage_read permission)"
-        echo '{"indexes": [], "error": "Usage Metering API not available"}' > "$OUTPUT_DIR/analytics/log_index_volume.json"
+        echo '{"indexes": [], "error": "Usage Metering API not available"}' > "$outfile"
+        log WARNING "Log index volume: no data returned — check that your Application Key has the 'usage_read' scope"
     fi
-    rm -f "$temp_file"
+    rm -f "$entries_file"
 }
 
 # ── Query 4: Monitor Modifications ───────────────────────────────────────────
 collect_monitor_modifications() {
     log INFO "Collecting monitor modification analytics..."
     local raw_file=$(mktemp)
-    audit_trail_query "@type:audit @asset.type:monitor @evt.name:(\"Monitor Created\" OR \"Monitor Modified\")" "$raw_file"
+    local fails_before=$FAILED_API_CALLS
+    audit_trail_query "@asset.type:monitor @evt.name:(\"Monitor Created\" OR \"Monitor Modified\")" "$raw_file"
+    if [[ $(jq 'length' "$raw_file" 2>/dev/null) == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
+        log WARNING "Monitor modifications: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+    fi
 
     jq '[group_by(.attributes.asset.id) | .[] | {
         monitor_id: .[0].attributes.asset.id,
@@ -1072,7 +1130,11 @@ collect_unused_dashboards() {
     local total_dashboards=$(echo "$all_dashboards" | grep -c . || echo 0)
 
     if [[ $total_dashboards -eq 0 ]]; then
-        log WARNING "No dashboards found in export to cross-reference"
+        if [[ "$SKIP_DASHBOARDS" == "true" ]]; then
+            log INFO "Skipping unused-dashboard cross-reference (--skip-dashboards was set)"
+        else
+            log WARNING "No dashboard files found in export — dashboards may not have been exported in this run"
+        fi
         echo '{"unused_dashboards": [], "total_dashboards": 0, "unused_count": 0}' > "$OUTPUT_DIR/analytics/unused_dashboards.json"
         return
     fi
@@ -1118,7 +1180,11 @@ collect_unused_monitors() {
     local total_monitors=$(echo "$all_monitors" | grep -c . || echo 0)
 
     if [[ $total_monitors -eq 0 ]]; then
-        log WARNING "No monitors found in export to cross-reference"
+        if [[ "$SKIP_MONITORS" == "true" ]]; then
+            log INFO "Skipping unused-monitor cross-reference (--skip-monitors was set)"
+        else
+            log WARNING "No monitor files found in export — monitors may not have been exported in this run"
+        fi
         echo '{"unused_monitors": [], "total_monitors": 0, "unused_count": 0}' > "$OUTPUT_DIR/analytics/unused_monitors.json"
         return
     fi

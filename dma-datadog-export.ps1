@@ -827,51 +827,78 @@ function Invoke-AuditTrailQuery {
     return $allEvents
 }
 
+function Invoke-EventsApiQuery {
+    param([string]$FilterQuery, [int]$MaxPages = 50)
+    $allEvents = [System.Collections.Generic.List[object]]::new()
+    $cursor    = ''
+    $page      = 0
+    $limit     = 1000
+    $from      = Get-UsageFromTimestamp
+    $to        = Get-UsageToTimestamp
+
+    Write-Log DEBUG "Events API query: $FilterQuery (from=$from to=$to)"
+
+    $encQ    = [System.Uri]::EscapeDataString($FilterQuery)
+    $encFrom = [System.Uri]::EscapeDataString($from)
+    $encTo   = [System.Uri]::EscapeDataString($to)
+
+    while ($page -lt $MaxPages) {
+        $ep = '/api/v2/events?filter[query]={0}&filter[from]={1}&filter[to]={2}&page[limit]={3}' -f $encQ, $encFrom, $encTo, $limit
+        if ($cursor) { $ep += ('&page[cursor]={0}' -f [System.Uri]::EscapeDataString($cursor)) }
+
+        $data = Invoke-DataDogApi -Method GET -Endpoint $ep
+        if ($null -eq $data) { Write-Log WARNING "Events API query failed on page $page"; break }
+
+        $pageEvents = if ($data.data) { @($data.data) } else { @() }
+        if ($pageEvents.Count -eq 0) { break }
+        foreach ($evt in $pageEvents) { $allEvents.Add($evt) }
+
+        $cursor = if ($data.meta -and $data.meta.page -and $data.meta.page.after) {
+            $data.meta.page.after
+        } else { '' }
+        $page++
+        Write-Log DEBUG "  Page $page`: $($pageEvents.Count) events (total: $($allEvents.Count))"
+        if (-not $cursor) { break }
+    }
+
+    Write-Log DEBUG "Events API collected $($allEvents.Count) events"
+    return $allEvents
+}
+
 function Collect-DashboardViews {
     Write-Log INFO "Collecting dashboard view analytics..."
-    $failsBefore = $script:FailedApiCalls
-    $events  = Invoke-AuditTrailQuery '@evt.name:"Dashboard Viewed"'
-    if (@($events).Count -eq 0 -and $script:FailedApiCalls -gt $failsBefore) {
-        Write-Log WARNING "Dashboard views: 0 results - Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
-    }
-    $grouped = $events | Group-Object { $_.attributes.asset.id } | ForEach-Object {
-        $g      = $_.Group
-        $emails = @($g | ForEach-Object { $_.attributes.usr.email } | Sort-Object -Unique)
-        $lastTs = ($g | Sort-Object { $_.attributes.timestamp } | Select-Object -Last 1).attributes.timestamp
-        [PSCustomObject]@{
-            dashboard_id   = $g[0].attributes.asset.id
-            dashboard_name = $g[0].attributes.asset.name
-            view_count     = $g.Count
-            unique_users   = $emails.Count
-            last_viewed    = $lastTs
-            users          = $emails
-        }
-    } | Sort-Object -Property view_count -Descending
-    Write-JsonObject -Path (Join-Path $script:OutputDir "analytics\dashboard_views.json") -Object @($grouped)
-    Write-Log SUCCESS "Dashboard views: $(@($grouped).Count) dashboards with activity"
+    $outFile = Join-Path $script:OutputDir "analytics\dashboard_views.json"
+    Write-JsonObject -Path $outFile -Object ([PSCustomObject]@{
+        views   = @()
+        error   = 'not_available'
+        message = 'DataDog does not expose dashboard view counts via a public API. View analytics are only available in the DataDog UI (Organization Settings -> Audit Trail filtered by @asset.type:dashboard, or via the Popular Dashboards feature on the Dashboards list page).'
+    })
+    Write-Log WARNING "Dashboard views: not available via DataDog API - see analytics\dashboard_views.json for UI alternatives"
 }
 
 function Collect-MonitorTriggers {
     Write-Log INFO "Collecting monitor trigger analytics..."
     $failsBefore = $script:FailedApiCalls
-    $events  = Invoke-AuditTrailQuery '@asset.type:monitor @evt.name:("Monitor Alert Triggered" OR "Monitor Resolved")'
+    $events  = Invoke-EventsApiQuery 'sources:monitors'
     if (@($events).Count -eq 0 -and $script:FailedApiCalls -gt $failsBefore) {
-        Write-Log WARNING "Monitor triggers: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+        Write-Log WARNING "Monitor triggers: Events API call failed. Ensure your API Key has Events read access."
     }
-    $grouped = $events | Group-Object { $_.attributes.asset.id } | ForEach-Object {
+    $grouped = $events | Group-Object { $_.attributes.attributes.monitor.id } | ForEach-Object {
         $g        = $_.Group
-        $triggers = @($g | Where-Object { $_.attributes.evt.name -eq 'Monitor Alert Triggered' }).Count
-        $resolves = @($g | Where-Object { $_.attributes.evt.name -eq 'Monitor Resolved' }).Count
+        $monId    = $g[0].attributes.attributes.monitor.id
+        $monName  = if ($g[0].attributes.title) { $g[0].attributes.title } else { "Monitor $monId" }
+        $triggers = @($g | Where-Object { $_.attributes.alert_type -eq 'triggered' }).Count
+        $resolves = @($g | Where-Object { $_.attributes.alert_type -eq 'recovered' }).Count
         $lastTs   = ($g | Sort-Object { $_.attributes.timestamp } | Select-Object -Last 1).attributes.timestamp
         [PSCustomObject]@{
-            monitor_id     = $g[0].attributes.asset.id
-            monitor_name   = $g[0].attributes.asset.name
+            monitor_id     = $monId
+            monitor_name   = $monName
             trigger_count  = $triggers
             resolve_count  = $resolves
             total_events   = $g.Count
             last_triggered = $lastTs
         }
-    } | Sort-Object -Property trigger_count -Descending
+    } | Where-Object { $_.monitor_id } | Sort-Object -Property trigger_count -Descending
     Write-JsonObject -Path (Join-Path $script:OutputDir "analytics\monitor_triggers.json") -Object @($grouped)
     Write-Log SUCCESS "Monitor triggers: $(@($grouped).Count) monitors with activity"
 }
@@ -894,20 +921,22 @@ function Collect-LogIndexVolume {
         $startHr = $windowStart.ToString('yyyy-MM-ddT00')
         $endHr   = $windowEnd.ToString('yyyy-MM-ddT23')
 
-        $data = Invoke-DataDogApi -Method GET -Endpoint ('/api/v1/usage/logs_by_index?start_hr={0}&end_hr={1}' -f $startHr, $endHr)
-        if ($data -and $data.usage) {
+        $data = Invoke-DataDogApi -Method GET -Endpoint ('/api/v2/usage/hourly_usage?product_families=indexed_logs&start_hr={0}&end_hr={1}' -f $startHr, $endHr)
+        if ($data -and $data.data) {
             $anyData = $true
-            foreach ($day in $data.usage) {
-                if (-not $day.by_index) { continue }
-                foreach ($entry in $day.by_index) {
-                    $n = $entry.index_name
-                    if (-not $totals.ContainsKey($n)) {
-                        $totals[$n] = @{ total_event_count = 0; total_retention_event_count = 0; days_active = 0 }
-                    }
-                    $totals[$n].total_event_count           += if ($entry.event_count)           { $entry.event_count }           else { 0 }
-                    $totals[$n].total_retention_event_count += if ($entry.retention_event_count) { $entry.retention_event_count } else { 0 }
-                    $totals[$n].days_active++
+            foreach ($entry in $data.data) {
+                $n = if ($entry.attributes.tags -and $entry.attributes.tags.'log_index_name') {
+                    $entry.attributes.tags.'log_index_name'
+                } elseif ($entry.attributes.tags -and $entry.attributes.tags.log_index_name) {
+                    $entry.attributes.tags.log_index_name
+                } else { continue }
+                if (-not $n) { continue }
+                if (-not $totals.ContainsKey($n)) {
+                    $totals[$n] = @{ total_event_count = 0; hours_active = 0 }
                 }
+                $measurement = $entry.attributes.measurements | Where-Object { $_.usage_type -eq 'logs_indexed_events_count' } | Select-Object -First 1
+                $totals[$n].total_event_count += if ($measurement -and $measurement.value) { [long]$measurement.value } else { 0 }
+                $totals[$n].hours_active++
             }
         }
         $windowStart = $windowStart.AddMonths(1)
@@ -916,10 +945,9 @@ function Collect-LogIndexVolume {
     if ($anyData) {
         $indexes = $totals.GetEnumerator() | ForEach-Object {
             [PSCustomObject]@{
-                index_name                   = $_.Key
-                total_event_count            = $_.Value.total_event_count
-                total_retention_event_count  = $_.Value.total_retention_event_count
-                days_active                  = $_.Value.days_active
+                index_name        = $_.Key
+                total_event_count = $_.Value.total_event_count
+                hours_active      = $_.Value.hours_active
             }
         } | Sort-Object -Property total_event_count -Descending
         Write-JsonObject -Path $outFile -Object ([PSCustomObject]@{
@@ -929,21 +957,21 @@ function Collect-LogIndexVolume {
         Write-Log SUCCESS "Log index volume: $(@($indexes).Count) indexes with usage data"
     } else {
         Write-JsonFile -Path $outFile -Content '{"indexes":[],"error":"Usage Metering API not available"}'
-        Write-Log WARNING "Log index volume: no data returned - check that your Application Key has the 'usage_read' scope"
+        Write-Log WARNING "Log index volume: no data returned from /api/v2/usage/hourly_usage - check that your Application Key has the 'usage_read' scope"
     }
 }
 
 function Collect-MonitorModifications {
     Write-Log INFO "Collecting monitor modification analytics..."
     $failsBefore = $script:FailedApiCalls
-    $events  = Invoke-AuditTrailQuery '@asset.type:monitor @evt.name:("Monitor Created" OR "Monitor Modified")'
+    $events  = Invoke-AuditTrailQuery '@asset.type:monitor @action:(created modified)'
     if (@($events).Count -eq 0 -and $script:FailedApiCalls -gt $failsBefore) {
         Write-Log WARNING "Monitor modifications: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
     }
     $grouped = $events | Group-Object { $_.attributes.asset.id } | ForEach-Object {
         $g        = $_.Group
-        $created  = @($g | Where-Object { $_.attributes.evt.name -eq 'Monitor Created' }).Count
-        $modified = @($g | Where-Object { $_.attributes.evt.name -eq 'Monitor Modified' }).Count
+        $created  = @($g | Where-Object { $_.attributes.action -eq 'created' }).Count
+        $modified = @($g | Where-Object { $_.attributes.action -eq 'modified' }).Count
         $lastTs   = ($g | Sort-Object { $_.attributes.timestamp } | Select-Object -Last 1).attributes.timestamp
         $editors  = @($g | ForEach-Object { $_.attributes.usr.email } | Sort-Object -Unique)
         [PSCustomObject]@{
@@ -977,11 +1005,29 @@ function Collect-UnusedDashboards {
         return
     }
 
-    $viewedIds = @()
+    $viewedIds         = @()
+    $viewDataAvailable = $true
     $vf = Join-Path $script:OutputDir "analytics\dashboard_views.json"
     if (Test-Path $vf) {
-        $viewedIds = @(Get-Content $vf -Raw | ConvertFrom-Json |
-            ForEach-Object { $_.dashboard_id } | Where-Object { $_ } | Sort-Object)
+        $vfContent = Get-Content $vf -Raw | ConvertFrom-Json
+        if ($vfContent.error -eq 'not_available') {
+            $viewDataAvailable = $false
+        } else {
+            $viewedIds = @($vfContent | ForEach-Object { $_.dashboard_id } | Where-Object { $_ } | Sort-Object)
+        }
+    }
+
+    if (-not $viewDataAvailable) {
+        Write-JsonObject -Path $outFile -Object ([PSCustomObject]@{
+            unused_dashboards    = @()
+            total_dashboards     = $allIds.Count
+            unused_count         = 0
+            view_data_available  = $false
+            note                 = 'Dashboard view data is not available via the DataDog API. Classification as used/unused cannot be determined.'
+            usage_period         = $script:UsagePeriodValue
+        })
+        Write-Log WARNING "Unused dashboards: cannot classify - dashboard view data is not available via the DataDog API"
+        return
     }
 
     $unusedIds = @($allIds | Where-Object { $_ -notin $viewedIds })
@@ -992,11 +1038,12 @@ function Collect-UnusedDashboards {
         [PSCustomObject]@{ dashboard_id = $_; title = $title }
     }
     Write-JsonObject -Path $outFile -Object ([PSCustomObject]@{
-        unused_dashboards = @($unusedList)
-        total_dashboards  = $allIds.Count
-        viewed_count      = $allIds.Count - $unusedIds.Count
-        unused_count      = $unusedIds.Count
-        usage_period      = $script:UsagePeriodValue
+        unused_dashboards    = @($unusedList)
+        total_dashboards     = $allIds.Count
+        viewed_count         = $allIds.Count - $unusedIds.Count
+        unused_count         = $unusedIds.Count
+        view_data_available  = $true
+        usage_period         = $script:UsagePeriodValue
     })
     Write-Log SUCCESS "Unused dashboards: $($unusedIds.Count) of $($allIds.Count) never viewed in $($script:UsagePeriodValue)"
 }
@@ -1046,7 +1093,7 @@ function Invoke-UsageAnalytics {
     if (-not $script:CollectUsage) { return }
     Write-Step "Collecting Usage Analytics"
     Write-Log INFO "Usage period: $($script:UsagePeriodValue)"
-    Write-Log INFO "APIs used: Audit Trail (v2), Usage Metering (v1)"
+    Write-Log INFO "APIs used: Audit Trail v2 (config changes), Events v2 (monitor firings), Usage Metering v2 (log index volume)"
 
     New-Item -ItemType Directory -Path (Join-Path $script:OutputDir "analytics") -Force | Out-Null
 
@@ -1069,12 +1116,31 @@ function Invoke-UsageAnalytics {
         from         = Get-UsageFromTimestamp
         to           = Get-UsageToTimestamp
         queries      = [PSCustomObject]@{
-            dashboard_views       = [PSCustomObject]@{ dashboards_with_views  = (& $getCount "dashboard_views.json"       $null) }
+            dashboard_views       = [PSCustomObject]@{ dashboards_with_views  = (& $getCount "dashboard_views.json"       $null); note = 'not_available_via_api' }
             monitor_triggers      = [PSCustomObject]@{ monitors_with_triggers = (& $getCount "monitor_triggers.json"      $null) }
             log_index_volume      = [PSCustomObject]@{ indexes_with_data      = (& $getCount "log_index_volume.json"      "indexes") }
             monitor_modifications = [PSCustomObject]@{ monitors_modified      = (& $getCount "monitor_modifications.json" $null) }
             unused_dashboards     = [PSCustomObject]@{ count                  = (& $getCount "unused_dashboards.json"     "unused_count") }
             unused_monitors       = [PSCustomObject]@{ count                  = (& $getCount "unused_monitors.json"       "unused_count") }
+        }
+        ui_queries = [PSCustomObject]@{
+            dashboard_views = [PSCustomObject]@{
+                note    = 'DataDog does not expose dashboard view counts via a public API.'
+                ui_path = 'Organization Settings -> Audit Trail -> filter: @asset.type:dashboard (shows config changes only, not views)'
+                tip     = 'For view activity, check the Popular Dashboards section on the Dashboards list page in the DataDog UI.'
+            }
+            monitor_triggers = [PSCustomObject]@{
+                events_explorer = 'Events -> Explorer -> filter: sources:monitors -> date range: last 30 days -> group by monitor'
+                notebook_query  = 'events("sources:monitors").rollup("count").by("monitor_id").last("30d")'
+            }
+            log_index_volume = [PSCustomObject]@{
+                notebook_query   = 'sum:datadog.estimated_usage.logs.ingested_events{*} by {index_name}.rollup(sum, 86400)'
+                built_in_dashboard = 'Log Management -> Log Management - Estimated Usage -> Indexed Logs section'
+            }
+            monitor_modifications = [PSCustomObject]@{
+                audit_trail_filter = '@asset.type:monitor @action:(created modified deleted)'
+                ui_path            = 'Organization Settings -> Audit Trail -> apply the filter above -> last 30 days'
+            }
         }
     })
     Write-Log SUCCESS "Usage analytics complete  - results in analytics/"
