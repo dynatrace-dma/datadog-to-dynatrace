@@ -177,6 +177,10 @@ $script:TotalApiCalls     = 0
 $script:SuccessfulApiCalls = 0
 $script:FailedApiCalls    = 0
 
+# Silent failure tracking (200 OK but empty results)
+$script:EmptyResultsWarnings = @()
+$script:SuspiciousEmptyCount = 0
+
 # =============================================================================
 # HELPERS
 # =============================================================================
@@ -223,6 +227,20 @@ function Show-Progress {
     $filled = [int](50 * $Current / $Total)
     $bar    = ('#' * $filled) + ('-' * (50 - $filled))
     Write-Host "`r  Progress: [$bar] $pct%" -NoNewline -ForegroundColor Cyan
+}
+
+function Track-EmptyResult {
+    param([string]$ResourceType, [string]$ScopeName)
+
+    $script:SuspiciousEmptyCount++
+    $script:EmptyResultsWarnings += @{
+        ResourceType = $ResourceType
+        ScopeName = $ScopeName
+    }
+
+    Write-Log WARNING "⚠️  Found 0 $ResourceType (API returned 200 OK)"
+    Write-Log WARNING "    This often means the Application Key is missing the '$ScopeName' scope"
+    Write-Log WARNING "    Run with -TestAccess to validate all required scopes"
 }
 
 function Write-JsonFile {
@@ -569,7 +587,11 @@ function Export-Dashboards {
     if ($null -eq $list) { Write-Log ERROR "Failed to fetch dashboard list"; return }
 
     $items = if ($list.dashboards) { @($list.dashboards) } else { @() }
-    Write-Log SUCCESS "Found $($items.Count) dashboards"
+    if ($items.Count -eq 0) {
+        Track-EmptyResult -ResourceType "dashboards" -ScopeName "dashboards_read"
+    } else {
+        Write-Log SUCCESS "Found $($items.Count) dashboards"
+    }
     $i = 0
     foreach ($d in $items) {
         $i++; Show-Progress $i $items.Count
@@ -590,7 +612,11 @@ function Export-Monitors {
     if ($null -eq $list) { Write-Log ERROR "Failed to fetch monitor list"; return }
 
     $items = if ($list -is [array]) { $list } else { @() }
-    Write-Log SUCCESS "Found $($items.Count) monitors"
+    if ($items.Count -eq 0) {
+        Track-EmptyResult -ResourceType "monitors" -ScopeName "monitors_read"
+    } else {
+        Write-Log SUCCESS "Found $($items.Count) monitors"
+    }
     $i = 0
     foreach ($m in $items) {
         $i++; Show-Progress $i $items.Count
@@ -614,7 +640,11 @@ function Export-LogsConfig {
         -OutputFile (Join-Path $pipDir "_list.json")
     if ($pipelines) {
         $items = if ($pipelines -is [array]) { $pipelines } else { @() }
-        Write-Log SUCCESS "Found $($items.Count) log pipelines"
+        if ($items.Count -eq 0) {
+            Track-EmptyResult -ResourceType "log pipelines" -ScopeName "logs_read_config"
+        } else {
+            Write-Log SUCCESS "Found $($items.Count) log pipelines"
+        }
         $i = 0
         foreach ($p in $items) {
             $i++; Show-Progress $i $items.Count
@@ -653,7 +683,11 @@ function Export-Synthetics {
     if ($null -eq $data) { Write-Log ERROR "Failed to fetch synthetic tests"; return }
 
     $items = if ($data.tests) { @($data.tests) } else { @() }
-    Write-Log SUCCESS "Found $($items.Count) synthetic tests"
+    if ($items.Count -eq 0) {
+        Track-EmptyResult -ResourceType "synthetic tests" -ScopeName "synthetics_read"
+    } else {
+        Write-Log SUCCESS "Found $($items.Count) synthetic tests"
+    }
     $i = 0
     foreach ($t in $items) {
         $i++; Show-Progress $i $items.Count
@@ -681,7 +715,11 @@ function Export-SLOs {
     } while ($batch.Count -eq $limit)
 
     Write-JsonObject -Path (Join-Path $dir "_list.json") -Object @{ data = $allSlos.ToArray() }
-    Write-Log SUCCESS "Found $($allSlos.Count) SLOs"
+    if ($allSlos.Count -eq 0) {
+        Track-EmptyResult -ResourceType "SLOs" -ScopeName "slos_read"
+    } else {
+        Write-Log SUCCESS "Found $($allSlos.Count) SLOs"
+    }
     $i = 0
     foreach ($slo in $allSlos) {
         $i++; Show-Progress $i $allSlos.Count
@@ -723,7 +761,11 @@ function Export-Metrics {
         -OutputFile (Join-Path $dir "_list.json")
     if ($data) {
         $count = if ($data.metrics) { $data.metrics.Count } else { 0 }
-        Write-Log SUCCESS "Found $count active metrics (last 24 hours)"
+        if ($count -eq 0) {
+            Track-EmptyResult -ResourceType "metrics" -ScopeName "metrics_read"
+        } else {
+            Write-Log SUCCESS "Found $count active metrics (last 24 hours)"
+        }
         Write-Log INFO "Metrics list saved (individual metadata export would be time-consuming)"
     } else { Write-Log WARNING "Failed to fetch metrics list" }
 }
@@ -768,7 +810,11 @@ function Export-UsersTeams {
             -OutputFile (Join-Path $dir $_.File)
         if ($result) {
             $count = if ($result.($_.Key)) { $result.($_.Key).Count } else { 0 }
-            Write-Log SUCCESS "Exported $count $($_.Label)"
+            if ($count -eq 0 -and $_.Label -eq "users") {
+                Track-EmptyResult -ResourceType "users" -ScopeName "user_access_read"
+            } else {
+                Write-Log SUCCESS "Exported $count $($_.Label)"
+            }
         } else { Write-Log WARNING "Failed to fetch $($_.Label)" }
     }
 }
@@ -1378,6 +1424,36 @@ function Main {
     Write-Host "  Export location : $($script:OutputDir)" -ForegroundColor White
     Write-Host "  Archive         : $(Join-Path $script:ExportDir "$($script:ExportName).tar.gz")" -ForegroundColor White
     Write-Host "  Log file        : $($script:LogFile)" -ForegroundColor White
+
+    # Show warnings for potential silent failures
+    if ($script:SuspiciousEmptyCount -gt 0) {
+        Write-Host ""
+        Write-Host ("=" * 78) -ForegroundColor Yellow
+        Write-Host "  ⚠️  POTENTIAL SILENT FAILURES DETECTED" -ForegroundColor Yellow
+        Write-Host ("=" * 78) -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Export completed successfully but $($script:SuspiciousEmptyCount) resource type(s) returned 0 items." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  This usually means your Application Key is MISSING REQUIRED SCOPES." -ForegroundColor Yellow
+        Write-Host "  DataDog APIs return HTTP 200 (success) even when scopes are missing." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Empty results for:" -ForegroundColor Yellow
+        foreach ($warning in $script:EmptyResultsWarnings) {
+            $resource = $warning.ResourceType.PadRight(30)
+            $scope = $warning.ScopeName.PadRight(20)
+            Write-Host "    • $resource (missing scope: $scope)" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "  CRITICAL: Your export is likely INCOMPLETE!" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  To fix:" -ForegroundColor Yellow
+        Write-Host "  1. Recreate your Application Key with ALL required scopes" -ForegroundColor White
+        Write-Host "  2. Run this script with -TestAccess to validate scopes" -ForegroundColor White
+        Write-Host "  3. Re-run the full export with the corrected Application Key" -ForegroundColor White
+        Write-Host ""
+        Write-Host ("=" * 78) -ForegroundColor Yellow
+        Write-Host ""
+    }
 
     if ($script:ErrorsEncountered -gt 0) {
         Write-Host ""
