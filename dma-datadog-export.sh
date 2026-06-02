@@ -183,6 +183,10 @@ TOTAL_API_CALLS=0
 SUCCESSFUL_API_CALLS=0
 FAILED_API_CALLS=0
 
+# Silent failure tracking (200 OK but empty results)
+declare -a EMPTY_RESULTS_WARNINGS=()
+SUSPICIOUS_EMPTY_COUNT=0
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
@@ -340,6 +344,19 @@ get_api_url() {
     echo "https://api.${site}.datadoghq.com"
 }
 
+# Track suspicious empty results (200 OK but 0 items - likely missing scope)
+track_empty_result() {
+    local resource_type="$1"
+    local scope_name="$2"
+
+    SUSPICIOUS_EMPTY_COUNT=$((SUSPICIOUS_EMPTY_COUNT + 1))
+    EMPTY_RESULTS_WARNINGS+=("$resource_type|$scope_name")
+
+    log WARNING "⚠️  Found 0 ${resource_type} (API returned 200 OK)"
+    log WARNING "    This often means the Application Key is missing the '${scope_name}' scope"
+    log WARNING "    Run with --test-access to validate all required scopes"
+}
+
 # Make authenticated API call to DataDog
 dd_api_call() {
     local method="$1"
@@ -467,7 +484,12 @@ export_dashboards() {
 
     if dd_api_call "GET" "/api/v1/dashboard" "$list_file"; then
         local count=$(jq '.dashboards | length' "$list_file" 2>/dev/null || echo "0")
-        log SUCCESS "Found $count dashboards"
+
+        if [[ "$count" -eq 0 ]]; then
+            track_empty_result "dashboards" "dashboards_read"
+        else
+            log SUCCESS "Found $count dashboards"
+        fi
 
         if [[ "$count" -gt 0 ]]; then
             # Extract dashboard IDs
@@ -511,7 +533,12 @@ export_monitors() {
 
     if dd_api_call "GET" "/api/v1/monitor" "$list_file"; then
         local count=$(jq '. | length' "$list_file" 2>/dev/null || echo "0")
-        log SUCCESS "Found $count monitors"
+
+        if [[ "$count" -eq 0 ]]; then
+            track_empty_result "monitors" "monitors_read"
+        else
+            log SUCCESS "Found $count monitors"
+        fi
 
         if [[ "$count" -gt 0 ]]; then
             # Save full list with all monitors
@@ -560,7 +587,12 @@ export_logs_config() {
 
     if dd_api_call "GET" "/api/v1/logs/config/pipelines" "$pipelines_list"; then
         local count=$(jq '. | length' "$pipelines_list" 2>/dev/null || echo "0")
-        log SUCCESS "Found $count log pipelines"
+
+        if [[ "$count" -eq 0 ]]; then
+            track_empty_result "log pipelines" "logs_read_config"
+        else
+            log SUCCESS "Found $count log pipelines"
+        fi
 
         if [[ "$count" -gt 0 ]]; then
             # Extract individual pipelines
@@ -631,7 +663,12 @@ export_synthetics() {
 
     if dd_api_call "GET" "/api/v1/synthetics/tests" "$list_file"; then
         local count=$(jq '.tests | length' "$list_file" 2>/dev/null || echo "0")
-        log SUCCESS "Found $count synthetic tests"
+
+        if [[ "$count" -eq 0 ]]; then
+            track_empty_result "synthetic tests" "synthetics_read"
+        else
+            log SUCCESS "Found $count synthetic tests"
+        fi
 
         if [[ "$count" -gt 0 ]]; then
             # Extract test IDs
@@ -706,7 +743,12 @@ export_slos() {
     # Save complete list
     echo "{\"data\": $all_slos}" > "$list_file"
     local count=$(echo "$all_slos" | jq '. | length' 2>/dev/null || echo "0")
-    log SUCCESS "Found $count SLOs"
+
+    if [[ "$count" -eq 0 ]]; then
+        track_empty_result "SLOs" "slos_read"
+    else
+        log SUCCESS "Found $count SLOs"
+    fi
 
     if [[ "$count" -gt 0 ]]; then
         # Extract individual SLOs
@@ -784,7 +826,12 @@ export_metrics() {
 
     if dd_api_call "GET" "/api/v1/metrics" "$list_file"; then
         local count=$(jq '.metrics | length' "$list_file" 2>/dev/null || echo "0")
-        log SUCCESS "Found $count active metrics"
+
+        if [[ "$count" -eq 0 ]]; then
+            track_empty_result "metrics" "metrics_read"
+        else
+            log SUCCESS "Found $count active metrics"
+        fi
 
         # Note: Getting metadata for each metric would be very slow
         # So we just save the list
@@ -852,7 +899,12 @@ export_users_teams() {
     local users_file="$users_dir/users.json"
     if dd_api_call "GET" "/api/v2/users" "$users_file"; then
         local count=$(jq '.data | length' "$users_file" 2>/dev/null || echo "0")
-        log SUCCESS "Exported $count users"
+
+        if [[ "$count" -eq 0 ]]; then
+            track_empty_result "users" "user_access_read"
+        else
+            log SUCCESS "Exported $count users"
+        fi
     else
         log WARNING "Failed to fetch users"
     fi
@@ -1036,7 +1088,7 @@ collect_log_index_volume() {
     local any_data=false
 
     local current="$from_date"
-    while [[ "$current" <= "$to_date" ]]; do
+    while [[ "$current" < "$to_date" ]] || [[ "$current" == "$to_date" ]]; do
         # Compute end of this monthly window
         local window_end
         if date -v -1d >/dev/null 2>&1; then
@@ -1819,6 +1871,37 @@ main() {
     print_color "$WHITE" "Export location: $OUTPUT_DIR"
     print_color "$WHITE" "Archive: $EXPORT_DIR/${EXPORT_NAME}.tar.gz"
     print_color "$WHITE" "Log file: $LOG_FILE"
+
+    # Show warnings for potential silent failures
+    if [[ $SUSPICIOUS_EMPTY_COUNT -gt 0 ]]; then
+        echo ""
+        print_color "$YELLOW" "${BOX_TL}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_TR}"
+        print_color "$YELLOW" "${BOX_V}  ⚠️  POTENTIAL SILENT FAILURES DETECTED                                      ${BOX_V}"
+        print_color "$YELLOW" "${BOX_T}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_B}"
+        print_color "$YELLOW" "${BOX_V}                                                                            ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  Export completed successfully but ${SUSPICIOUS_EMPTY_COUNT} resource type(s) returned 0 items.  ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}                                                                            ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  This usually means your Application Key is MISSING REQUIRED SCOPES.       ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  DataDog APIs return HTTP 200 (success) even when scopes are missing.     ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}                                                                            ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  Empty results for:                                                        ${BOX_V}"
+
+        for warning in "${EMPTY_RESULTS_WARNINGS[@]}"; do
+            IFS='|' read -r resource scope <<< "$warning"
+            printf "${YELLOW}${BOX_V}    • %-30s (missing scope: %-20s) ${BOX_V}${NC}\n" "$resource" "$scope"
+        done
+
+        print_color "$YELLOW" "${BOX_V}                                                                            ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  CRITICAL: Your export is likely INCOMPLETE!                               ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}                                                                            ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  To fix:                                                                   ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  1. Recreate your Application Key with ALL required scopes                 ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  2. Run this script with --test-access to validate scopes                  ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}  3. Re-run the full export with the corrected Application Key              ${BOX_V}"
+        print_color "$YELLOW" "${BOX_V}                                                                            ${BOX_V}"
+        print_color "$YELLOW" "${BOX_BL}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_BR}"
+        echo ""
+    fi
 
     if [[ $ERRORS_ENCOUNTERED -gt 0 ]]; then
         echo ""
