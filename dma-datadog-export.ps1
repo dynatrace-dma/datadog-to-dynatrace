@@ -245,7 +245,7 @@ function Track-EmptyResult {
         ScopeName = $ScopeName
     }
 
-    Write-Log WARNING "⚠️  Found 0 $ResourceType (API returned 200 OK)"
+    Write-Log WARNING "[!]  Found 0 $ResourceType (API returned 200 OK)"
     Write-Log WARNING "    This often means the Application Key is missing the '$ScopeName' scope"
     Write-Log WARNING "    Run with -TestAccess to validate all required scopes"
 }
@@ -284,13 +284,13 @@ function Get-DataDogApiUrl {
         $site = ($site -replace '^https?://', '').TrimEnd('/')
     }
 
-    # If value contains a dot, it's a domain — strip 'app.' prefix and build API URL
+    # If value contains a dot, it's a domain - strip 'app.' prefix and build API URL
     if ($site -match '\.') {
         $site = $site -replace '^app\.', ''
         return "https://api.$site"
     }
 
-    # Unknown short code — warn the user; dedicated orgs on US1 should use -Site app
+    # Unknown short code - warn the user; dedicated orgs on US1 should use -Site app
     Write-Warning "Unknown site identifier '$($script:DatadogSite)'. Known codes: app/us1, us3, us5, eu, ap1."
     Write-Warning "If this is a dedicated org on US1 infrastructure, use -Site app instead. Use -CustomUrl to set an explicit API URL."
     return "https://api.$site.datadoghq.com"
@@ -373,7 +373,7 @@ function Invoke-DataDogApi {
 
 # ---------------------------------------------------------------------------
 # Concurrent fetch-by-ID via a runspace pool. Parity with bash
-# fetch_ids_concurrent. Windows PowerShell 5.1 compatible — RunspacePool, NOT
+# fetch_ids_concurrent. Windows PowerShell 5.1 compatible - RunspacePool, NOT
 # ForEach-Object -Parallel (which is PS7+ only).
 #
 #   Phase 1: dispatch all IDs through a pool throttled to -MaxParallel. Each
@@ -409,7 +409,7 @@ function Invoke-IdsConcurrent {
     $apiKey  = $script:DatadogApiKey
     $appKey  = $script:DatadogAppKey
 
-    # Self-contained worker — no access to $script:* (runspaces don't share it).
+    # Self-contained worker - no access to $script:* (runspaces don't share it).
     $worker = {
         param($Url, $OutFile, $ApiKey, $AppKey)
         $headers = @{
@@ -450,7 +450,7 @@ function Invoke-IdsConcurrent {
         $pool.Close(); $pool.Dispose()
     }
 
-    # Phase 2 — sequential retry of rate-limited / missing items.
+    # Phase 2 - sequential retry of rate-limited / missing items.
     $headers = @{
         'DD-API-KEY'         = $apiKey
         'DD-APPLICATION-KEY' = $appKey
@@ -555,7 +555,7 @@ function Invoke-TestAccess {
         $results.Add([PSCustomObject]@{ Category = $Cat; Status = $St; Detail = $Det })
     }
 
-    # ── Credentials ──────────────────────────────────────────────────────────
+    # -- Credentials ----------------------------------------------------------
     Write-Host "  Testing credentials..." -NoNewline -ForegroundColor Cyan
     $r = Test-ApiEndpoint "/api/v1/validate"
     if ($r.OK) {
@@ -569,74 +569,74 @@ function Invoke-TestAccess {
         return
     }
 
-    # ── Organization ─────────────────────────────────────────────────────────
+    # -- Organization ---------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/org"
     $orgDetail = if ($r.OK -and $r.Data.org.name) { "$($r.Data.org.name)" } `
                  elseif ($r.OK) { "Retrieved OK" } `
                  else { Format-AuthError $r.StatusCode }
     Add-Result "Organization" $(if ($r.OK) { "PASS" } else { "WARN" }) $orgDetail
 
-    # ── Dashboards ───────────────────────────────────────────────────────────
+    # -- Dashboards -----------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/dashboard"
     if ($r.OK) { Add-Result "Dashboards" "PASS" "$(@($r.Data.dashboards).Count) found" }
     else       { Add-Result "Dashboards" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Monitors ─────────────────────────────────────────────────────────────
+    # -- Monitors -------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/monitor"
     if ($r.OK) { Add-Result "Monitors / Alerts" "PASS" "$(if ($r.Data -is [array]) { $r.Data.Count } else { 0 }) found" }
     else       { Add-Result "Monitors / Alerts" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Log Pipelines ─────────────────────────────────────────────────────────
+    # -- Log Pipelines ---------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/logs/config/pipelines"
     if ($r.OK) { Add-Result "Log Pipelines" "PASS" "$(if ($r.Data -is [array]) { $r.Data.Count } else { 0 }) found" }
     else       { Add-Result "Log Pipelines" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Log Indexes ───────────────────────────────────────────────────────────
+    # -- Log Indexes -----------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/logs/config/indexes"
     if ($r.OK) { Add-Result "Log Indexes" "PASS" "$(@($r.Data.indexes).Count) found" }
     else       { Add-Result "Log Indexes" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Synthetic Tests ───────────────────────────────────────────────────────
+    # -- Synthetic Tests -------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/synthetics/tests"
     if ($r.OK) { Add-Result "Synthetic Tests" "PASS" "$(@($r.Data.tests).Count) found" }
     else       { Add-Result "Synthetic Tests" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── SLOs ──────────────────────────────────────────────────────────────────
+    # -- SLOs ------------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/slo?limit=10"
     if ($r.OK) { Add-Result "SLOs" "PASS" "$(@($r.Data.data).Count) found (first page)" }
     else       { Add-Result "SLOs" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Downtimes ─────────────────────────────────────────────────────────────
+    # -- Downtimes -------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v2/downtime"
     if ($r.OK) { Add-Result "Downtimes" "PASS" "$(@($r.Data.data).Count) found" }
     else       { Add-Result "Downtimes" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
+    # -- Metrics ---------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/metrics"
     if ($r.OK) { Add-Result "Metrics Metadata" "PASS" "$(@($r.Data.metrics).Count) active metrics" }
     else       { Add-Result "Metrics Metadata" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Webhooks ──────────────────────────────────────────────────────────────
+    # -- Webhooks --------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v1/integration/webhooks/configuration/webhooks"
     if ($r.OK) { Add-Result "Webhooks" "PASS" "$(if ($r.Data -is [array]) { $r.Data.Count } else { 0 }) found" }
     else       { Add-Result "Webhooks" "WARN" (Format-AuthError $r.StatusCode) }
 
-    # ── Users ─────────────────────────────────────────────────────────────────
+    # -- Users -----------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v2/users"
     if ($r.OK) { Add-Result "Users" "PASS" "$(@($r.Data.data).Count) found" }
     else       { Add-Result "Users" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Roles ─────────────────────────────────────────────────────────────────
+    # -- Roles -----------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v2/roles"
     if ($r.OK) { Add-Result "Roles" "PASS" "$(@($r.Data.data).Count) found" }
     else       { Add-Result "Roles" "FAIL" (Format-AuthError $r.StatusCode) }
 
-    # ── Teams ─────────────────────────────────────────────────────────────────
+    # -- Teams -----------------------------------------------------------------
     $r = Test-ApiEndpoint "/api/v2/team"
     if ($r.OK) { Add-Result "Teams" "PASS" "$(@($r.Data.data).Count) found" }
     else       { Add-Result "Teams" "WARN" (Format-AuthError $r.StatusCode) }
 
-    # ── Usage Analytics: Audit Trail (audit_trail_read) ───────────────────────
+    # -- Usage Analytics: Audit Trail (audit_trail_read) -----------------------
     $r = Test-ApiEndpoint "/api/v2/audit/events?page[limit]=1"
     if ($r.OK) {
         Add-Result "Usage: Audit Trail (audit_trail_read)" "PASS" "Accessible - --usage will collect views/triggers"
@@ -646,7 +646,7 @@ function Invoke-TestAccess {
         Add-Result "Usage: Audit Trail (audit_trail_read)" "WARN" (Format-AuthError $r.StatusCode)
     }
 
-    # ── Usage Analytics: Usage Metering (usage_read) ─────────────────────────
+    # -- Usage Analytics: Usage Metering (usage_read) -------------------------
     $fromHr = (Get-Date).AddDays(-1).ToUniversalTime().ToString('yyyy-MM-ddTHH')
     $toHr   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH')
     $r      = Test-ApiEndpoint ('/api/v1/usage/logs_by_index?start_hr={0}&end_hr={1}' -f $fromHr, $toHr)
@@ -658,7 +658,7 @@ function Invoke-TestAccess {
         Add-Result "Usage: Metering (usage_read)" "WARN" (Format-AuthError $r.StatusCode)
     }
 
-    # ── Results table ─────────────────────────────────────────────────────────
+    # -- Results table ---------------------------------------------------------
     Show-AccessTestTable $results.ToArray()
 
     $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
@@ -1261,7 +1261,7 @@ function Collect-MonitorModifications {
     $failsBefore = $script:FailedApiCalls
     $events  = Invoke-AuditTrailQuery '@asset.type:monitor @action:(created modified)'
     if (@($events).Count -eq 0 -and $script:FailedApiCalls -gt $failsBefore) {
-        Write-Log WARNING "Monitor modifications: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
+        Write-Log WARNING "Monitor modifications: 0 results - Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings -> API Keys -> Application Keys)."
     }
     $grouped = $events | Group-Object { $_.attributes.asset.id } | ForEach-Object {
         $g        = $_.Group
@@ -1354,7 +1354,7 @@ function Collect-UnusedMonitors {
         if ($script:SkipMonitorsF) {
             Write-Log INFO "Skipping unused-monitor cross-reference (-SkipMonitors was set)"
         } else {
-            Write-Log WARNING "No monitor files found in $monDir — monitors may not have been exported in this run"
+            Write-Log WARNING "No monitor files found in $monDir - monitors may not have been exported in this run"
         }
         Write-JsonFile -Path $outFile -Content '{"unused_monitors":[],"total_monitors":0,"unused_count":0}'
         return
@@ -1679,7 +1679,7 @@ function Main {
     if ($script:SuspiciousEmptyCount -gt 0) {
         Write-Host ""
         Write-Host ("=" * 78) -ForegroundColor Yellow
-        Write-Host "  ⚠️  POTENTIAL SILENT FAILURES DETECTED" -ForegroundColor Yellow
+        Write-Host "  [!]  POTENTIAL SILENT FAILURES DETECTED" -ForegroundColor Yellow
         Write-Host ("=" * 78) -ForegroundColor Yellow
         Write-Host ""
         Write-Host "  Export completed successfully but $($script:SuspiciousEmptyCount) resource type(s) returned 0 items." -ForegroundColor Yellow
@@ -1691,7 +1691,7 @@ function Main {
         foreach ($warning in $script:EmptyResultsWarnings) {
             $resource = $warning.ResourceType.PadRight(30)
             $scope = $warning.ScopeName.PadRight(20)
-            Write-Host "    • $resource (missing scope: $scope)" -ForegroundColor Yellow
+            Write-Host "    * $resource (missing scope: $scope)" -ForegroundColor Yellow
         }
         Write-Host ""
         Write-Host "  CRITICAL: Your export is likely INCOMPLETE!" -ForegroundColor Yellow
