@@ -10,13 +10,13 @@ Run the export with the `--usage` / `-Usage` flag. The following files are writt
 
 | File | API Used | Contents |
 |------|----------|----------|
-| `monitor_triggers.json` | Events API v2 | Per-monitor trigger and recovery counts for the usage period |
-| `log_index_volume.json` | Usage Metering v2 | Per-index ingested event counts aggregated over the usage period |
+| `monitor_triggers.json` | Audit Trail v2 (bash) / Events API v2 (PowerShell) | Per-monitor trigger and recovery counts for the usage period |
+| `log_index_volume.json` | Usage Metering v1 (bash) / v2 (PowerShell) | Per-index ingested event counts aggregated over the usage period |
 | `monitor_modifications.json` | Audit Trail v2 | Monitor change history — who created or modified each monitor and when |
 | `unused_monitors.json` | Cross-reference | Monitors that never triggered in the usage period |
 | `_summary.json` | — | Aggregate counts for all of the above, plus UI query guidance |
 
-Required Application Key scopes: `audit_trail_read` (for monitor modifications) and `usage_read` (for log index volume). Monitor trigger data requires no additional scope.
+Required Application Key scopes: `audit_trail_read` (for monitor modifications) and `usage_read` (for log index volume). Monitor trigger data comes from the Audit Trail (bash — needs `audit_trail_read`) or the Events API (PowerShell — needs Events read access).
 
 ---
 
@@ -24,9 +24,12 @@ Required Application Key scopes: `audit_trail_read` (for monitor modifications) 
 
 ### Dashboard View Counts
 
-**`analytics/dashboard_views.json` will always contain `"error": "not_available"`.**
+DataDog exposes **no public API for per-dashboard view counts or per-user access history.** The two scripts handle this differently:
 
-DataDog does not expose a public API endpoint that returns per-dashboard view counts or per-user access history. The Audit Trail API only records configuration changes (create, edit, delete) — it does not record who opened a dashboard. Because view data is unavailable, `unused_dashboards.json` will also report `"view_data_available": false` rather than attempting to classify dashboards as used or unused.
+- **PowerShell** does not attempt it: `analytics/dashboard_views.json` always contains `{"error": "not_available"}`, and `unused_dashboards.json` reports `"view_data_available": false`.
+- **Bash** attempts a best-effort proxy by querying the Audit Trail for `"Dashboard Viewed"` events. This is populated **only if your DataDog plan records those events** in the Audit Trail; on plans that do not, the file is an empty array.
+
+Because reliable view data is not generally available, always collect the **Dashboards → Popular Dashboards** list from the UI manually (below) and share it with your DMA consultant.
 
 ---
 
@@ -134,4 +137,4 @@ Collect the following from the DataDog UI and share them alongside the `.tar.gz`
 | Log index volume | "Log Management - Estimated Usage" dashboard or Notebook query | CSV export or screenshot |
 | Monitor change history | Audit Trail → `@asset.type:monitor @action:(created modified deleted)` → Download button | CSV export |
 
-> **Why dashboard view activity cannot be exported:** DataDog's Popular Dashboards list is driven by internal, non-public telemetry. There is no API endpoint, Notebook metric, or UI export button that surfaces per-dashboard view counts. If precise view data is essential for migration scoping, ask the customer's DataDog account team — some enterprise plans include an Advanced Usage Attribution add-on that provides this data, but it is not universally available.
+> **Why dashboard view activity cannot be exported:** DataDog's Popular Dashboards list is driven by internal, non-public telemetry. There is no API endpoint, Notebook metric, or UI export button that surfaces per-dashboard view counts. If precise view data is essential for migration scoping, ask your DataDog account team — some enterprise plans include an Advanced Usage Attribution add-on that provides this data, but it is not universally available.

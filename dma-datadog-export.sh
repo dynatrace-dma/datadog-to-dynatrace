@@ -9,7 +9,7 @@ fi
 
 ################################################################################
 #
-#  DMA DataDog Export Script v2.0.0
+#  DMA DataDog Export Script v2.0.1
 #
 #  REST API-Only Data Collection for DataDog to Dynatrace Migration
 #
@@ -112,7 +112,7 @@ set -o pipefail  # Fail on pipe errors
 # SCRIPT CONFIGURATION
 # =============================================================================
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 SCRIPT_NAME="DMA DataDog Export"
 
 # ANSI color codes
@@ -171,6 +171,14 @@ SKIP_METRICS=false
 SKIP_USERS=false
 COLLECT_USAGE=false
 TEST_ACCESS=false
+
+# Concurrency for endpoints that must be fetched one item at a time.
+# Tuned to each endpoint's measured x-ratelimit-limit; the concurrent fetcher
+# additionally self-paces via X-RateLimit-Reset on 429, so these are safe
+# upper bounds rather than hard throttles. Override via environment if needed.
+DASHBOARD_CONCURRENCY="${DASHBOARD_CONCURRENCY:-10}"    # limit 600/60s  (10/s)
+SYNTHETICS_CONCURRENCY="${SYNTHETICS_CONCURRENCY:-10}"  # limit 1450/60s (24/s)
+LOGS_CONCURRENCY="${LOGS_CONCURRENCY:-5}"               # limit 420/60s  (7/s)
 
 # Progress tracking
 TOTAL_STEPS=0
@@ -430,6 +438,194 @@ dd_api_call() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# Concurrent fetch-by-ID using curl --parallel.
+#
+# All requests are dispatched inside a SINGLE curl process — no bash subprocess
+# forking, no temp header files per request, no process-table pressure.
+# curl --parallel-max caps in-flight connections; --retry / --retry-delay handle
+# transient 5xx automatically. 429 (rate-limit) is handled by a post-pass retry
+# loop: any ID whose output file is missing or is a 429-body gets retried
+# sequentially with a backoff derived from the response (or 10s default).
+#
+# Requirements: curl 7.66+ (ships with macOS Monterey+; verified 8.7.1 here).
+#
+#   $1 = max parallel connections (tuned per endpoint's x-ratelimit-limit)
+#   $2 = URL path template containing the literal token __ID__
+#   $3 = output file path template containing the literal token __ID__
+#   stdin = newline-separated IDs
+# ---------------------------------------------------------------------------
+fetch_ids_concurrent() {
+    local max_parallel="$1"
+    local url_tmpl="$2"
+    local out_tmpl="$3"
+
+    [[ "$max_parallel" =~ ^[0-9]+$ ]] && [ "$max_parallel" -gt 0 ] || max_parallel=8
+
+    # Collect IDs, skip blanks
+    local ids=()
+    while IFS= read -r id; do
+        [ -z "${id//[[:space:]]/}" ] && continue
+        ids+=("$id")
+    done
+
+    local total="${#ids[@]}"
+    [ "$total" -eq 0 ] && return 0
+
+    # Build a curl config file: one entry per ID separated by --next.
+    # curl --parallel dispatches all entries concurrently inside a single process
+    # (no forking, no extra bash subprocesses, no file-descriptor pressure).
+    # 429 detection is done post-run by inspecting the output files.
+    local cfg_file; cfg_file="$(mktemp)"
+    local id url out first=1
+    for id in "${ids[@]}"; do
+        url="${DATADOG_API_URL}${url_tmpl//__ID__/$id}"
+        out="${out_tmpl//__ID__/$id}"
+        if [ "$first" = "1" ]; then
+            first=0
+        else
+            printf -- '--next\n' >> "$cfg_file"
+        fi
+        printf -- '--url "%s"\n--output "%s"\n--header "DD-API-KEY: %s"\n--header "DD-APPLICATION-KEY: %s"\n--header "Content-Type: application/json"\n' \
+            "$url" "$out" "${DATADOG_API_KEY}" "${DATADOG_APP_KEY}" >> "$cfg_file"
+    done
+
+    # First pass: fire all requests in parallel inside one curl process.
+    curl -s --parallel --parallel-max "$max_parallel" --config "$cfg_file"
+    rm -f "$cfg_file"
+
+    # Retry pass: any output file that contains a 429 JSON body (or is absent)
+    # means the item was rate-limited. Re-fetch sequentially with backoff.
+    local retry_ids=() attempt
+    for id in "${ids[@]}"; do
+        out="${out_tmpl//__ID__/$id}"
+        if [ ! -f "$out" ] || grep -q '"status":429\|"errors":\["Too many requests' "$out" 2>/dev/null; then
+            retry_ids+=("$id")
+            rm -f "$out"
+        fi
+    done
+
+    if [ "${#retry_ids[@]}" -gt 0 ]; then
+        log WARNING "  Rate-limited on ${#retry_ids[@]} items — retrying with backoff..."
+        for id in "${retry_ids[@]}"; do
+            url="${DATADOG_API_URL}${url_tmpl//__ID__/$id}"
+            out="${out_tmpl//__ID__/$id}"
+            attempt=0
+            while [ "$attempt" -lt 5 ]; do
+                local code; code="$(curl -s -o "$out" -w "%{http_code}" \
+                    -H "DD-API-KEY: ${DATADOG_API_KEY}" \
+                    -H "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
+                    -H "Content-Type: application/json" \
+                    "$url")"
+                case "$code" in
+                    200|201) break ;;
+                    429) sleep $(( 10 + (RANDOM % 5) )); attempt=$((attempt+1)) ;;
+                    5*) sleep $(( 3 + (RANDOM % 3) )); attempt=$((attempt+1)) ;;
+                    *) rm -f "$out"; break ;;
+                esac
+            done
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Save a single list/config endpoint to a file, degrading gracefully:
+#   200/201 -> save body, log item count (best-effort)
+#   401/403 -> WARN "missing scope" and skip (endpoint is real, key lacks scope)
+#   404     -> INFO "not available" and skip
+#   other   -> WARN and skip
+# Never aborts the export. Used for the breadth of single-call resources.
+#   $1 = human label   $2 = API path   $3 = absolute output file
+# ---------------------------------------------------------------------------
+export_simple_list() {
+    local label="$1" endpoint="$2" out_file="$3"
+    mkdir -p "$(dirname "$out_file")"
+    local tmp hdr code
+    tmp=$(mktemp); hdr=$(mktemp)
+    code=$(curl -s -D "$hdr" -o "$tmp" -w "%{http_code}" \
+        -H "DD-API-KEY: ${DATADOG_API_KEY}" \
+        -H "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
+        -H "Content-Type: application/json" \
+        "${DATADOG_API_URL}${endpoint}")
+    TOTAL_API_CALLS=$((TOTAL_API_CALLS + 1))
+    case "$code" in
+        200|201)
+            SUCCESSFUL_API_CALLS=$((SUCCESSFUL_API_CALLS + 1))
+            cp "$tmp" "$out_file"
+            # Count only when the candidate path is genuinely an array — avoids
+            # the `null|length == 0` trap that mislabels non-.data shapes as empty.
+            local n=""
+            for p in '.data' '.dashboard_lists' '.variables' '.locations' '.notebooks' '.tags' '.accounts' '.'; do
+                n=$(jq -r "if (${p}|type)==\"array\" then (${p}|length) else empty end" "$tmp" 2>/dev/null)
+                [[ "$n" =~ ^[0-9]+$ ]] && break || n=""
+            done
+            [ -z "$n" ] && n="?"
+            if [ "$n" = "0" ]; then
+                log INFO "  $label: 0 (accessible, empty)"
+            else
+                log SUCCESS "  $label: $n"
+            fi
+            ;;
+        401|403) log WARNING "  $label: skipped — Application Key missing required scope (HTTP $code)" ;;
+        404)     log INFO    "  $label: not available on this org (HTTP 404)" ;;
+        *)       FAILED_API_CALLS=$((FAILED_API_CALLS + 1)); log WARNING "  $label: failed (HTTP $code)" ;;
+    esac
+    rm -f "$tmp" "$hdr"
+}
+
+# Export the full breadth of remaining single-call configuration resources.
+# Each is best-effort: empty or scope-gated resources are noted and skipped so
+# the same script exports them automatically wherever the data/scopes exist.
+export_additional_resources() {
+    print_step "Exporting Additional Resources"
+
+    # label | API endpoint | output file (relative to OUTPUT_DIR)
+    local rows=(
+        # Visualization & content
+        "Notebooks|/api/v1/notebooks|notebooks/_list.json"
+        "Dashboard lists|/api/v1/dashboard/lists/manual|dashboards/lists.json"
+        "Powerpacks|/api/v2/powerpacks|powerpacks/_list.json"
+        # Monitoring extras
+        "SLO corrections|/api/v1/slo/correction|slos/corrections.json"
+        "Monitor config policies|/api/v2/monitor/policy|monitors/config_policies.json"
+        # Logs (beyond pipelines/indexes)
+        "Log archives|/api/v2/logs/config/archives|logs/archives.json"
+        "Log metrics|/api/v2/logs/config/metrics|logs/metrics.json"
+        "Log custom destinations|/api/v2/logs/config/custom-destinations|logs/custom_destinations.json"
+        "Log restriction queries|/api/v2/logs/config/restriction_queries|logs/restriction_queries.json"
+        # APM / spans / RUM
+        "APM retention filters|/api/v2/apm/config/retention-filters|apm/retention_filters.json"
+        "Spans metrics|/api/v2/apm/config/metrics|apm/spans_metrics.json"
+        "RUM applications|/api/v2/rum/applications|rum/applications.json"
+        # Synthetics extras
+        "Synthetics global variables|/api/v1/synthetics/variables|synthetics/global_variables.json"
+        "Synthetics private locations|/api/v1/synthetics/locations|synthetics/locations.json"
+        # Security / catalog / reference
+        "Security monitoring rules|/api/v2/security_monitoring/rules|security/monitoring_rules.json"
+        "Service definitions (Software Catalog)|/api/v2/services/definitions|service_catalog/definitions.json"
+        "Reference tables|/api/v2/reference-tables/tables|reference_tables/_list.json"
+        "Incidents|/api/v2/incidents|incidents/_list.json"
+        # Org / access
+        "Authn mappings|/api/v2/authn_mappings|users/authn_mappings.json"
+        # Integrations
+        "AWS integration|/api/v1/integration/aws|integrations/aws.json"
+        "Azure integration|/api/v1/integration/azure|integrations/azure.json"
+        "GCP integration (legacy)|/api/v1/integration/gcp|integrations/gcp.json"
+        "GCP integration (STS)|/api/v2/integration/gcp/accounts|integrations/gcp_sts.json"
+        "PagerDuty integration|/api/v1/integration/pagerduty|integrations/pagerduty.json"
+        # Infrastructure
+        "Host tags|/api/v1/tags/hosts|infra/host_tags.json"
+    )
+
+    local row label endpoint out
+    for row in "${rows[@]}"; do
+        IFS='|' read -r label endpoint out <<< "$row"
+        export_simple_list "$label" "$endpoint" "$OUTPUT_DIR/$out"
+    done
+
+    return 0
+}
+
 # Validate DataDog credentials
 validate_credentials() {
     print_step "Validating DataDog API Credentials"
@@ -479,38 +675,70 @@ export_dashboards() {
     local dashboards_dir="$OUTPUT_DIR/dashboards"
     mkdir -p "$dashboards_dir"
 
-    log INFO "Fetching dashboard list..."
+    log INFO "Fetching dashboard list (paginated)..."
     local list_file="$dashboards_dir/_list.json"
 
-    if dd_api_call "GET" "/api/v1/dashboard" "$list_file"; then
-        local count=$(jq '.dashboards | length' "$list_file" 2>/dev/null || echo "0")
+    # Paginate dashboard list to avoid rate limits
+    local page=0
+    local page_size=5000  # Maximum supported by DataDog API
+    local all_dashboards="[]"
+    local total_fetched=0
 
-        if [[ "$count" -eq 0 ]]; then
-            track_empty_result "dashboards" "dashboards_read"
+    while true; do
+        local temp_file=$(mktemp)
+        local offset=$((page * page_size))
+
+        if dd_api_call "GET" "/api/v1/dashboard?start=${offset}&count=${page_size}" "$temp_file"; then
+            local batch=$(jq '.dashboards' "$temp_file" 2>/dev/null || echo "[]")
+            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+
+            if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
+                break
+            fi
+
+            # Merge with existing results
+            all_dashboards=$(jq -s '.[0] + .[1]' <(echo "$all_dashboards") <(echo "$batch"))
+            total_fetched=$((total_fetched + batch_count))
+
+            rm -f "$temp_file"
+            page=$((page + 1))
+
+            if [[ "$batch_count" -lt "$page_size" ]]; then
+                break
+            fi
         else
-            log SUCCESS "Found $count dashboards"
+            log WARNING "Failed to fetch dashboards at offset $offset"
+            rm -f "$temp_file"
+            break
         fi
+    done
 
-        if [[ "$count" -gt 0 ]]; then
-            # Extract dashboard IDs
-            local dashboard_ids=$(jq -r '.dashboards[].id' "$list_file" 2>/dev/null)
+    # Save complete list
+    echo "{\"dashboards\": $all_dashboards}" > "$list_file"
+    local count=$(echo "$all_dashboards" | jq 'length' 2>/dev/null || echo "0")
 
-            local current=0
-            while IFS= read -r dashboard_id; do
-                current=$((current + 1))
-                show_progress $current $count
-
-                local output_file="$dashboards_dir/dashboard-${dashboard_id}.json"
-                dd_api_call "GET" "/api/v1/dashboard/${dashboard_id}" "$output_file" >/dev/null 2>&1
-
-            done <<< "$dashboard_ids"
-
-            echo ""  # New line after progress bar
-            log SUCCESS "Exported $count dashboards"
-        fi
+    if [[ "$count" -eq 0 ]]; then
+        track_empty_result "dashboards" "dashboards_read"
     else
-        log ERROR "Failed to fetch dashboard list"
-        return 1
+        log SUCCESS "Found $count dashboards"
+    fi
+
+    if [[ "$count" -gt 0 ]]; then
+        # Dashboards MUST be fetched individually: the list response carries
+        # only metadata (no `widgets`). Rate limit (measured): 600/60s = 10/s.
+        # Fetch concurrently; the helper self-paces via X-RateLimit-Reset.
+        local dashboard_ids=$(jq -r '.[]|.id' <(echo "$all_dashboards") 2>/dev/null)
+
+        log INFO "Fetching $count dashboards concurrently (full widget definitions)..."
+        echo "$dashboard_ids" | fetch_ids_concurrent "$DASHBOARD_CONCURRENCY" \
+            "/api/v1/dashboard/__ID__" \
+            "$dashboards_dir/dashboard-__ID__.json"
+
+        local exported=$(ls "$dashboards_dir"/dashboard-*.json 2>/dev/null | wc -l | tr -d ' ')
+        TOTAL_API_CALLS=$((TOTAL_API_CALLS + exported))
+        SUCCESSFUL_API_CALLS=$((SUCCESSFUL_API_CALLS + exported))
+        log SUCCESS "Exported $exported / $count dashboards"
     fi
 
     return 0
@@ -528,41 +756,74 @@ export_monitors() {
     local monitors_dir="$OUTPUT_DIR/monitors"
     mkdir -p "$monitors_dir"
 
-    log INFO "Fetching monitor list..."
+    log INFO "Fetching monitor list (paginated)..."
     local list_file="$monitors_dir/_list.json"
 
-    if dd_api_call "GET" "/api/v1/monitor" "$list_file"; then
-        local count=$(jq '. | length' "$list_file" 2>/dev/null || echo "0")
+    # Paginate monitor list to avoid rate limits
+    local page=0
+    local page_size=5000  # Maximum supported by DataDog API
+    local all_monitors="[]"
+    local total_fetched=0
 
-        if [[ "$count" -eq 0 ]]; then
-            track_empty_result "monitors" "monitors_read"
+    while true; do
+        local temp_file=$(mktemp)
+
+        if dd_api_call "GET" "/api/v1/monitor?page=${page}&page_size=${page_size}" "$temp_file"; then
+            local batch=$(cat "$temp_file" 2>/dev/null || echo "[]")
+            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+
+            if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
+                break
+            fi
+
+            # Merge with existing results
+            all_monitors=$(jq -s '.[0] + .[1]' <(echo "$all_monitors") <(echo "$batch"))
+            total_fetched=$((total_fetched + batch_count))
+
+            rm -f "$temp_file"
+            page=$((page + 1))
+
+            if [[ "$batch_count" -lt "$page_size" ]]; then
+                break
+            fi
         else
-            log SUCCESS "Found $count monitors"
+            log WARNING "Failed to fetch monitors at page $page"
+            rm -f "$temp_file"
+            break
         fi
+    done
 
-        if [[ "$count" -gt 0 ]]; then
-            # Save full list with all monitors
-            log INFO "Saving complete monitor list..."
+    # Save complete list
+    echo "$all_monitors" > "$list_file"
+    local count=$(echo "$all_monitors" | jq 'length' 2>/dev/null || echo "0")
 
-            # Extract individual monitors
-            local monitor_ids=$(jq -r '.[].id' "$list_file" 2>/dev/null)
-
-            local current=0
-            while IFS= read -r monitor_id; do
-                current=$((current + 1))
-                show_progress $current $count
-
-                local output_file="$monitors_dir/monitor-${monitor_id}.json"
-                dd_api_call "GET" "/api/v1/monitor/${monitor_id}" "$output_file" >/dev/null 2>&1
-
-            done <<< "$monitor_ids"
-
-            echo ""  # New line after progress bar
-            log SUCCESS "Exported $count monitors"
-        fi
+    if [[ "$count" -eq 0 ]]; then
+        track_empty_result "monitors" "monitors_read"
     else
-        log ERROR "Failed to fetch monitor list"
-        return 1
+        log SUCCESS "Found $count monitors"
+    fi
+
+    if [[ "$count" -gt 0 ]]; then
+        # Save full list with all monitors
+        log INFO "Saving complete monitor list..."
+
+        # Extract individual monitors from the list (no need to re-fetch)
+        # The list response already contains full monitor details
+        log INFO "Extracting individual monitor files from list..."
+
+        local current=0
+        jq -c '.[]' "$list_file" 2>/dev/null | while IFS= read -r monitor_json; do
+            current=$((current + 1))
+            show_progress $current $count
+
+            local monitor_id=$(echo "$monitor_json" | jq -r '.id')
+            local output_file="$monitors_dir/monitor-${monitor_id}.json"
+            echo "$monitor_json" | jq '.' > "$output_file"
+        done
+
+        echo ""  # New line after progress bar
+        log SUCCESS "Exported $count monitors"
     fi
 
     return 0
@@ -595,19 +856,13 @@ export_logs_config() {
         fi
 
         if [[ "$count" -gt 0 ]]; then
-            # Extract individual pipelines
+            # Pipelines fetched individually (measured limit 420/60s = 7/s).
             local pipeline_ids=$(jq -r '.[].id' "$pipelines_list" 2>/dev/null)
 
-            local current=0
-            while IFS= read -r pipeline_id; do
-                current=$((current + 1))
-                show_progress $current $count
-
-                local output_file="$logs_dir/pipelines/pipeline-${pipeline_id}.json"
-                dd_api_call "GET" "/api/v1/logs/config/pipelines/${pipeline_id}" "$output_file" >/dev/null 2>&1
-
-            done <<< "$pipeline_ids"
-            echo ""
+            log INFO "Fetching $count log pipelines concurrently..."
+            echo "$pipeline_ids" | fetch_ids_concurrent "$LOGS_CONCURRENCY" \
+                "/api/v1/logs/config/pipelines/__ID__" \
+                "$logs_dir/pipelines/pipeline-__ID__.json"
             log SUCCESS "Exported $count log pipelines"
         fi
     else
@@ -658,38 +913,74 @@ export_synthetics() {
     local synthetics_dir="$OUTPUT_DIR/synthetics"
     mkdir -p "$synthetics_dir"
 
-    log INFO "Fetching synthetic tests..."
+    log INFO "Fetching synthetic tests (paginated)..."
     local list_file="$synthetics_dir/_list.json"
 
-    if dd_api_call "GET" "/api/v1/synthetics/tests" "$list_file"; then
-        local count=$(jq '.tests | length' "$list_file" 2>/dev/null || echo "0")
+    # Paginate synthetic tests
+    local page=0
+    local page_size=5000  # Maximum supported by DataDog API
+    local all_tests="[]"
 
-        if [[ "$count" -eq 0 ]]; then
-            track_empty_result "synthetic tests" "synthetics_read"
+    while true; do
+        local temp_file=$(mktemp)
+
+        if dd_api_call "GET" "/api/v1/synthetics/tests?page=${page}&page_size=${page_size}" "$temp_file"; then
+            local batch=$(jq '.tests' "$temp_file" 2>/dev/null || echo "[]")
+            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+
+            if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
+                break
+            fi
+
+            all_tests=$(jq -s '.[0] + .[1]' <(echo "$all_tests") <(echo "$batch"))
+            rm -f "$temp_file"
+            page=$((page + 1))
+
+            if [[ "$batch_count" -lt "$page_size" ]]; then
+                break
+            fi
         else
-            log SUCCESS "Found $count synthetic tests"
+            log WARNING "Failed to fetch synthetic tests at page $page"
+            rm -f "$temp_file"
+            break
         fi
+    done
 
-        if [[ "$count" -gt 0 ]]; then
-            # Extract test IDs
-            local test_ids=$(jq -r '.tests[].public_id' "$list_file" 2>/dev/null)
+    echo "{\"tests\": $all_tests}" > "$list_file"
+    local count=$(echo "$all_tests" | jq 'length' 2>/dev/null || echo "0")
 
-            local current=0
-            while IFS= read -r test_id; do
-                current=$((current + 1))
-                show_progress $current $count
-
-                local output_file="$synthetics_dir/test-${test_id}.json"
-                dd_api_call "GET" "/api/v1/synthetics/tests/${test_id}" "$output_file" >/dev/null 2>&1
-
-            done <<< "$test_ids"
-
-            echo ""
-            log SUCCESS "Exported $count synthetic tests"
-        fi
+    if [[ "$count" -eq 0 ]]; then
+        track_empty_result "synthetic tests" "synthetics_read"
     else
-        log ERROR "Failed to fetch synthetic tests"
-        return 1
+        log SUCCESS "Found $count synthetic tests"
+    fi
+
+    if [[ "$count" -gt 0 ]]; then
+        # The synthetics LIST response already contains the full `config` for
+        # API tests, so write every test straight from the list — no per-test
+        # fetch needed for the 80%+ that are API tests.
+        log INFO "Writing $count synthetic tests from list..."
+        jq -c '.[]' <(echo "$all_tests") 2>/dev/null | while IFS= read -r t; do
+            local pid=$(echo "$t" | jq -r '.public_id')
+            echo "$t" | jq '.' > "$synthetics_dir/test-${pid}.json"
+        done
+
+        # Browser tests are the exception: their `steps` are NOT in the list
+        # config and only come from /synthetics/tests/browser/{id}. Fetch those
+        # concurrently (measured limit 1450/60s = 24/s) and overwrite the
+        # list-derived file with the steps-included full object.
+        local browser_ids=$(jq -r '.[] | select(.type=="browser") | .public_id' <(echo "$all_tests") 2>/dev/null)
+        local browser_count=$(printf '%s\n' "$browser_ids" | grep -c '[^[:space:]]')
+
+        if [[ "$browser_count" -gt 0 ]]; then
+            log INFO "Fetching $browser_count browser tests with full steps (concurrent)..."
+            echo "$browser_ids" | fetch_ids_concurrent "$SYNTHETICS_CONCURRENCY" \
+                "/api/v1/synthetics/tests/browser/__ID__" \
+                "$synthetics_dir/test-__ID__.json"
+        fi
+
+        log SUCCESS "Exported $count synthetic tests ($browser_count browser w/ full steps)"
     fi
 
     return 0
@@ -778,32 +1069,54 @@ export_downtimes() {
     local downtimes_dir="$OUTPUT_DIR/downtimes"
     mkdir -p "$downtimes_dir"
 
-    log INFO "Fetching downtimes..."
+    log INFO "Fetching downtimes (paginated)..."
     local list_file="$downtimes_dir/_list.json"
 
-    if dd_api_call "GET" "/api/v2/downtime" "$list_file"; then
-        local count=$(jq '.data | length' "$list_file" 2>/dev/null || echo "0")
-        log SUCCESS "Found $count downtimes"
+    # Paginate downtimes (v2 API uses page[limit] and page[offset])
+    local offset=0
+    local limit=1000  # Maximum supported by v2 API
+    local all_downtimes="[]"
 
-        if [[ "$count" -gt 0 ]]; then
-            # Extract downtime IDs
-            local downtime_ids=$(jq -r '.data[].id' "$list_file" 2>/dev/null)
+    while true; do
+        local temp_file=$(mktemp)
 
-            local current=0
-            while IFS= read -r downtime_id; do
-                current=$((current + 1))
-                show_progress $current $count
+        if dd_api_call "GET" "/api/v2/downtime?page%5Blimit%5D=${limit}&page%5Boffset%5D=${offset}" "$temp_file"; then
+            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
+            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
 
-                local output_file="$downtimes_dir/downtime-${downtime_id}.json"
-                dd_api_call "GET" "/api/v2/downtime/${downtime_id}" "$output_file" >/dev/null 2>&1
+            if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
+                break
+            fi
 
-            done <<< "$downtime_ids"
+            all_downtimes=$(jq -s '.[0] + .[1]' <(echo "$all_downtimes") <(echo "$batch"))
+            rm -f "$temp_file"
+            offset=$((offset + limit))
 
-            echo ""
-            log SUCCESS "Exported $count downtimes"
+            if [[ "$batch_count" -lt "$limit" ]]; then
+                break
+            fi
+        else
+            log WARNING "Failed to fetch downtimes at offset $offset"
+            rm -f "$temp_file"
+            break
         fi
-    else
-        log WARNING "Failed to fetch downtimes"
+    done
+
+    echo "{\"data\": $all_downtimes}" > "$list_file"
+    local count=$(echo "$all_downtimes" | jq 'length' 2>/dev/null || echo "0")
+    log SUCCESS "Found $count downtimes"
+
+    if [[ "$count" -gt 0 ]]; then
+        # The v2 downtime LIST response carries the full object (verified:
+        # list .attributes == GET /downtime/{id} .attributes), so write each
+        # downtime straight from the list — no per-ID fetch required.
+        log INFO "Writing $count downtimes from list..."
+        jq -c '.[]' <(echo "$all_downtimes") 2>/dev/null | while IFS= read -r dt; do
+            local dtid=$(echo "$dt" | jq -r '.id')
+            echo "$dt" | jq '.' > "$downtimes_dir/downtime-${dtid}.json"
+        done
+        log SUCCESS "Exported $count downtimes"
     fi
 
     return 0
@@ -824,7 +1137,10 @@ export_metrics() {
     log INFO "Fetching active metrics list..."
     local list_file="$metrics_dir/_list.json"
 
-    if dd_api_call "GET" "/api/v1/metrics" "$list_file"; then
+    # DataDog requires a 'from' timestamp - use 24 hours ago for active metrics
+    local from_ts=$(date -u -v-1d "+%s" 2>/dev/null || date -u -d "1 day ago" "+%s" 2>/dev/null)
+
+    if dd_api_call "GET" "/api/v1/metrics?from=${from_ts}" "$list_file"; then
         local count=$(jq '.metrics | length' "$list_file" 2>/dev/null || echo "0")
 
         if [[ "$count" -eq 0 ]]; then
@@ -894,40 +1210,117 @@ export_users_teams() {
     local users_dir="$OUTPUT_DIR/users"
     mkdir -p "$users_dir"
 
-    # Export users
-    log INFO "Fetching users..."
+    # Export users (paginated)
+    log INFO "Fetching users (paginated)..."
     local users_file="$users_dir/users.json"
-    if dd_api_call "GET" "/api/v2/users" "$users_file"; then
-        local count=$(jq '.data | length' "$users_file" 2>/dev/null || echo "0")
+    local page_number=0
+    local page_size=1000  # Maximum supported by v2 API
+    local all_users="[]"
 
-        if [[ "$count" -eq 0 ]]; then
-            track_empty_result "users" "user_access_read"
+    while true; do
+        local temp_file=$(mktemp)
+        if dd_api_call "GET" "/api/v2/users?page%5Bsize%5D=${page_size}&page%5Bnumber%5D=${page_number}" "$temp_file"; then
+            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
+            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+
+            if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
+                break
+            fi
+
+            all_users=$(jq -s '.[0] + .[1]' <(echo "$all_users") <(echo "$batch"))
+            rm -f "$temp_file"
+            page_number=$((page_number + 1))
+
+            if [[ "$batch_count" -lt "$page_size" ]]; then
+                break
+            fi
         else
-            log SUCCESS "Exported $count users"
+            log WARNING "Failed to fetch users at page $page_number"
+            rm -f "$temp_file"
+            break
         fi
+    done
+
+    echo "{\"data\": $all_users}" > "$users_file"
+    local count=$(echo "$all_users" | jq 'length' 2>/dev/null || echo "0")
+
+    if [[ "$count" -eq 0 ]]; then
+        track_empty_result "users" "user_access_read"
     else
-        log WARNING "Failed to fetch users"
+        log SUCCESS "Exported $count users"
     fi
 
-    # Export roles
-    log INFO "Fetching roles..."
+    # Export roles (paginated)
+    log INFO "Fetching roles (paginated)..."
     local roles_file="$users_dir/roles.json"
-    if dd_api_call "GET" "/api/v2/roles" "$roles_file"; then
-        local count=$(jq '.data | length' "$roles_file" 2>/dev/null || echo "0")
-        log SUCCESS "Exported $count roles"
-    else
-        log WARNING "Failed to fetch roles"
-    fi
+    page_number=0
+    local roles_page_size=100  # v2 roles API rejects page sizes above 100
+    local all_roles="[]"
 
-    # Export teams
-    log INFO "Fetching teams..."
+    while true; do
+        local temp_file=$(mktemp)
+        if dd_api_call "GET" "/api/v2/roles?page%5Bsize%5D=${roles_page_size}&page%5Bnumber%5D=${page_number}" "$temp_file"; then
+            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
+            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+
+            if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
+                break
+            fi
+
+            all_roles=$(jq -s '.[0] + .[1]' <(echo "$all_roles") <(echo "$batch"))
+            rm -f "$temp_file"
+            page_number=$((page_number + 1))
+
+            if [[ "$batch_count" -lt "$page_size" ]]; then
+                break
+            fi
+        else
+            log WARNING "Failed to fetch roles at page $page_number"
+            rm -f "$temp_file"
+            break
+        fi
+    done
+
+    echo "{\"data\": $all_roles}" > "$roles_file"
+    local count=$(echo "$all_roles" | jq 'length' 2>/dev/null || echo "0")
+    log SUCCESS "Exported $count roles"
+
+    # Export teams (paginated)
+    log INFO "Fetching teams (paginated)..."
     local teams_file="$users_dir/teams.json"
-    if dd_api_call "GET" "/api/v2/team" "$teams_file"; then
-        local count=$(jq '.data | length' "$teams_file" 2>/dev/null || echo "0")
-        log SUCCESS "Exported $count teams"
-    else
-        log WARNING "Failed to fetch teams"
-    fi
+    page_number=0
+    local all_teams="[]"
+
+    while true; do
+        local temp_file=$(mktemp)
+        if dd_api_call "GET" "/api/v2/team?page%5Bsize%5D=${page_size}&page%5Bnumber%5D=${page_number}" "$temp_file"; then
+            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
+            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+
+            if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
+                break
+            fi
+
+            all_teams=$(jq -s '.[0] + .[1]' <(echo "$all_teams") <(echo "$batch"))
+            rm -f "$temp_file"
+            page_number=$((page_number + 1))
+
+            if [[ "$batch_count" -lt "$page_size" ]]; then
+                break
+            fi
+        else
+            log WARNING "Failed to fetch teams at page $page_number"
+            rm -f "$temp_file"
+            break
+        fi
+    done
+
+    echo "{\"data\": $all_teams}" > "$teams_file"
+    local count=$(echo "$all_teams" | jq 'length' 2>/dev/null || echo "0")
+    log SUCCESS "Exported $count teams"
 
     return 0
 }
@@ -1537,6 +1930,9 @@ run_test_access() {
         esac
     }
 
+    # Compute timestamp for metrics API (requires 'from' parameter)
+    local metrics_from=$(date -u -v-1d "+%s" 2>/dev/null || date -u -d "1 day ago" "+%s" 2>/dev/null)
+
     test_one "Credentials"              "/api/v1/validate"                            "if .valid then 1 else 0 end"
     test_one "Organization"             "/api/v1/org"                                 ".org | if . then 1 else 0 end"
     test_one "Dashboards"               "/api/v1/dashboard"                           ".dashboards | length"
@@ -1546,7 +1942,7 @@ run_test_access() {
     test_one "Synthetic Tests"          "/api/v1/synthetics/tests?page_size=1"        ".tests | length"
     test_one "SLOs"                     "/api/v1/slo?limit=1"                         ".data | length"
     test_one "Downtimes"                "/api/v2/downtime?page%5Blimit%5D=1"          ".data | length"
-    test_one "Metrics"                  "/api/v1/metrics?q=avg:*"                     ".metrics | length"
+    test_one "Metrics"                  "/api/v1/metrics?from=${metrics_from}"        ".metrics | length"
     test_one "Webhooks"                 "/api/v1/integration/webhooks"                ".webhooks | length"
     test_one "Users"                    "/api/v2/users?page%5Bsize%5D=1"             ".data | length"
     test_one "Roles"                    "/api/v2/roles?page%5Bsize%5D=1"             ".data | length"
@@ -1827,7 +2223,7 @@ main() {
     log INFO "================================"
 
     # Calculate total steps
-    TOTAL_STEPS=10
+    TOTAL_STEPS=11
     [[ "$SKIP_DASHBOARDS" == "true" ]] && TOTAL_STEPS=$((TOTAL_STEPS - 1))
     [[ "$SKIP_MONITORS" == "true" ]] && TOTAL_STEPS=$((TOTAL_STEPS - 1))
     [[ "$SKIP_LOGS" == "true" ]] && TOTAL_STEPS=$((TOTAL_STEPS - 1))
@@ -1853,6 +2249,7 @@ main() {
     export_metrics
     export_webhooks
     export_users_teams
+    export_additional_resources
 
     # Collect usage analytics (if --usage flag is set)
     collect_usage_analytics

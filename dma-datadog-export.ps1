@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    DMA DataDog Export Script v2.0.0 (PowerShell)
+    DMA DataDog Export Script v2.0.1 (PowerShell)
 
 .DESCRIPTION
     REST API-Only Data Collection for DataDog to Dynatrace Migration.
@@ -123,7 +123,7 @@ param(
 # SCRIPT CONFIGURATION
 # =============================================================================
 
-$script:ScriptVersion     = "2.0.0"
+$script:ScriptVersion     = "2.0.1"
 $script:ScriptName        = "DMA DataDog Export"
 
 $script:DatadogApiKey     = $ApiKey
@@ -176,6 +176,13 @@ $script:ErrorsEncountered = 0
 $script:TotalApiCalls     = 0
 $script:SuccessfulApiCalls = 0
 $script:FailedApiCalls    = 0
+
+# Per-endpoint concurrency caps for concurrent fetch-by-ID (parity with bash).
+# Tuned to each endpoint's measured x-ratelimit-limit; overridable via env var.
+# 5.1-safe: a non-numeric/<=0 env value falls back to the default.
+$script:DashboardConcurrency  = if (($env:DASHBOARD_CONCURRENCY  -as [int]) -gt 0) { [int]$env:DASHBOARD_CONCURRENCY }  else { 10 }
+$script:SyntheticsConcurrency = if (($env:SYNTHETICS_CONCURRENCY -as [int]) -gt 0) { [int]$env:SYNTHETICS_CONCURRENCY } else { 10 }
+$script:LogsConcurrency       = if (($env:LOGS_CONCURRENCY       -as [int]) -gt 0) { [int]$env:LOGS_CONCURRENCY }       else { 5 }
 
 # Silent failure tracking (200 OK but empty results)
 $script:EmptyResultsWarnings = @()
@@ -362,6 +369,126 @@ function Invoke-DataDogApi {
     $script:FailedApiCalls++
     Write-Log ERROR "API call failed after $maxRetries retries: $Endpoint"
     return $null
+}
+
+# ---------------------------------------------------------------------------
+# Concurrent fetch-by-ID via a runspace pool. Parity with bash
+# fetch_ids_concurrent. Windows PowerShell 5.1 compatible — RunspacePool, NOT
+# ForEach-Object -Parallel (which is PS7+ only).
+#
+#   Phase 1: dispatch all IDs through a pool throttled to -MaxParallel. Each
+#     runspace GETs one URL and writes the body on 2xx, a
+#     {"__ratelimited__":429} sentinel on 429, or nothing on other errors.
+#   Phase 2: any ID whose file is missing or holds the sentinel is retried
+#     sequentially with backoff (429: 10+rand s, 5xx: 3+rand s, <=5 attempts).
+#     An ID still failing leaves NO file (never a bogus/sentinel body).
+#
+# Relies on the process-global ServicePointManager TLS 1.2 + cert policy set at
+# script init (inherited by in-process runspaces). Do NOT move those per-call.
+#
+#   -MaxParallel      in-flight connection cap (throttle)
+#   -UrlTemplate      API path containing the literal token __ID__
+#   -OutFileTemplate  absolute output path containing the literal token __ID__
+#   -Ids              ids to fetch (blank/whitespace entries skipped)
+# ---------------------------------------------------------------------------
+function Invoke-IdsConcurrent {
+    param(
+        [int]$MaxParallel,
+        [string]$UrlTemplate,
+        [string]$OutFileTemplate,
+        [string[]]$Ids
+    )
+
+    $clean = @($Ids | Where-Object { $_ -and "$_".Trim() -ne "" })
+    if ($clean.Count -eq 0) { return }
+    if ($MaxParallel -le 0) { $MaxParallel = 8 }
+
+    Write-Log DEBUG "  runspace pool max-parallel=$MaxParallel for $($clean.Count) items"
+
+    $apiBase = $script:DatadogApiUrl
+    $apiKey  = $script:DatadogApiKey
+    $appKey  = $script:DatadogAppKey
+
+    # Self-contained worker — no access to $script:* (runspaces don't share it).
+    $worker = {
+        param($Url, $OutFile, $ApiKey, $AppKey)
+        $headers = @{
+            'DD-API-KEY'         = $ApiKey
+            'DD-APPLICATION-KEY' = $AppKey
+            'Content-Type'       = 'application/json'
+        }
+        try {
+            $resp = Invoke-WebRequest -Uri $Url -Method GET -Headers $headers `
+                -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
+            [System.IO.File]::WriteAllText($OutFile, $resp.Content, [System.Text.UTF8Encoding]::new($false))
+        } catch {
+            $code = 0
+            if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+            if ($code -eq 429) {
+                [System.IO.File]::WriteAllText($OutFile, '{"__ratelimited__":429}', [System.Text.UTF8Encoding]::new($false))
+            }
+        }
+    }
+
+    $pool = [runspacefactory]::CreateRunspacePool(1, $MaxParallel)
+    $pool.Open()
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($id in $clean) {
+            $url = $apiBase + ($UrlTemplate -replace '__ID__', $id)
+            $out = ($OutFileTemplate -replace '__ID__', $id)
+            $ps  = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($worker).AddArgument($url).AddArgument($out).AddArgument($apiKey).AddArgument($appKey)
+            $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
+        }
+        foreach ($j in $jobs) {
+            try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
+            $j.PS.Dispose()
+        }
+    } finally {
+        $pool.Close(); $pool.Dispose()
+    }
+
+    # Phase 2 — sequential retry of rate-limited / missing items.
+    $headers = @{
+        'DD-API-KEY'         = $apiKey
+        'DD-APPLICATION-KEY' = $appKey
+        'Content-Type'       = 'application/json'
+    }
+    $retry = @()
+    foreach ($id in $clean) {
+        $out = ($OutFileTemplate -replace '__ID__', $id)
+        if (-not (Test-Path $out)) {
+            $retry += $id
+        } elseif ((Get-Content -Path $out -Raw) -match '"__ratelimited__":429') {
+            Remove-Item $out -Force
+            $retry += $id
+        }
+    }
+
+    if ($retry.Count -gt 0) {
+        Write-Log WARNING "  Rate-limited on $($retry.Count) item(s) - retrying with backoff..."
+        foreach ($id in $retry) {
+            $url = $apiBase + ($UrlTemplate -replace '__ID__', $id)
+            $out = ($OutFileTemplate -replace '__ID__', $id)
+            $attempt = 0
+            while ($attempt -lt 5) {
+                try {
+                    $resp = Invoke-WebRequest -Uri $url -Method GET -Headers $headers `
+                        -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
+                    [System.IO.File]::WriteAllText($out, $resp.Content, [System.Text.UTF8Encoding]::new($false))
+                    break
+                } catch {
+                    $code = 0
+                    if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if     ($code -eq 429) { Start-Sleep -Seconds (10 + (Get-Random -Maximum 5)); $attempt++ }
+                    elseif ($code -ge 500) { Start-Sleep -Seconds (3 + (Get-Random -Maximum 3));  $attempt++ }
+                    else { if (Test-Path $out) { Remove-Item $out -Force }; break }
+                }
+            }
+        }
+    }
 }
 
 # =============================================================================
@@ -592,13 +719,18 @@ function Export-Dashboards {
     } else {
         Write-Log SUCCESS "Found $($items.Count) dashboards"
     }
-    $i = 0
-    foreach ($d in $items) {
-        $i++; Show-Progress $i $items.Count
-        Invoke-DataDogApi -Method GET -Endpoint "/api/v1/dashboard/$($d.id)" `
-            -OutputFile (Join-Path $dir "dashboard-$($d.id).json") | Out-Null
+    if ($items.Count -gt 0) {
+        # Dashboards MUST be fetched individually: the list carries only metadata
+        # (no widgets). Fetch concurrently; measured rate limit ~600/60s = 10/s.
+        Write-Log INFO "Fetching $($items.Count) dashboards concurrently (full widget definitions)..."
+        Invoke-IdsConcurrent -MaxParallel $script:DashboardConcurrency `
+            -UrlTemplate "/api/v1/dashboard/__ID__" `
+            -OutFileTemplate (Join-Path $dir "dashboard-__ID__.json") `
+            -Ids @($items | ForEach-Object { "$($_.id)" })
+        $exported = (Get-ChildItem -Path $dir -Filter "dashboard-*.json" -ErrorAction SilentlyContinue).Count
+        $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
+        Write-Log SUCCESS "Exported $exported / $($items.Count) dashboards"
     }
-    if ($items.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($items.Count) dashboards" }
 }
 
 function Export-Monitors {
@@ -645,13 +777,16 @@ function Export-LogsConfig {
         } else {
             Write-Log SUCCESS "Found $($items.Count) log pipelines"
         }
-        $i = 0
-        foreach ($p in $items) {
-            $i++; Show-Progress $i $items.Count
-            Invoke-DataDogApi -Method GET -Endpoint "/api/v1/logs/config/pipelines/$($p.id)" `
-                -OutputFile (Join-Path $pipDir "pipeline-$($p.id).json") | Out-Null
+        if ($items.Count -gt 0) {
+            Write-Log INFO "Fetching $($items.Count) log pipelines concurrently..."
+            Invoke-IdsConcurrent -MaxParallel $script:LogsConcurrency `
+                -UrlTemplate "/api/v1/logs/config/pipelines/__ID__" `
+                -OutFileTemplate (Join-Path $pipDir "pipeline-__ID__.json") `
+                -Ids @($items | ForEach-Object { "$($_.id)" })
+            $exported = (Get-ChildItem -Path $pipDir -Filter "pipeline-*.json" -ErrorAction SilentlyContinue).Count
+            $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
+            Write-Log SUCCESS "Exported $exported / $($items.Count) log pipelines"
         }
-        if ($items.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($items.Count) log pipelines" }
     } else { Write-Log WARNING "Failed to fetch log pipelines" }
 
     Write-Log INFO "Fetching log indexes..."
@@ -688,13 +823,16 @@ function Export-Synthetics {
     } else {
         Write-Log SUCCESS "Found $($items.Count) synthetic tests"
     }
-    $i = 0
-    foreach ($t in $items) {
-        $i++; Show-Progress $i $items.Count
-        Invoke-DataDogApi -Method GET -Endpoint "/api/v1/synthetics/tests/$($t.public_id)" `
-            -OutputFile (Join-Path $dir "test-$($t.public_id).json") | Out-Null
+    if ($items.Count -gt 0) {
+        Write-Log INFO "Fetching $($items.Count) synthetic tests concurrently (full step definitions)..."
+        Invoke-IdsConcurrent -MaxParallel $script:SyntheticsConcurrency `
+            -UrlTemplate "/api/v1/synthetics/tests/__ID__" `
+            -OutFileTemplate (Join-Path $dir "test-__ID__.json") `
+            -Ids @($items | ForEach-Object { "$($_.public_id)" })
+        $exported = (Get-ChildItem -Path $dir -Filter "test-*.json" -ErrorAction SilentlyContinue).Count
+        $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
+        Write-Log SUCCESS "Exported $exported / $($items.Count) synthetic tests"
     }
-    if ($items.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($items.Count) synthetic tests" }
 }
 
 function Export-SLOs {
@@ -816,6 +954,117 @@ function Export-UsersTeams {
                 Write-Log SUCCESS "Exported $count $($_.Label)"
             }
         } else { Write-Log WARNING "Failed to fetch $($_.Label)" }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Count items in a single-call list body without mislabeling non-.data shapes
+# as empty (parity with bash export_simple_list candidate-path probing).
+# Returns the count as a string, "0" for an accessible-but-empty array, or "?"
+# when no array-typed candidate is found.
+# ---------------------------------------------------------------------------
+function Get-ListItemCount {
+    param([string]$Json)
+    try { $o = $Json | ConvertFrom-Json } catch { return '?' }
+    foreach ($p in 'data','dashboard_lists','variables','locations','notebooks','tags','accounts') {
+        if ($o -and $o.PSObject.Properties[$p]) {
+            $v = $o.$p
+            if ($v -is [array]) { return "$($v.Count)" }
+        }
+    }
+    if ($o -is [array]) { return "$($o.Count)" }
+    return '?'
+}
+
+# ---------------------------------------------------------------------------
+# Save a single list/config endpoint to a file, degrading gracefully (parity
+# with bash export_simple_list):
+#   200/201 -> save body + log item count
+#   401/403 -> WARN "missing scope" and skip (endpoint real, key lacks scope)
+#   404     -> INFO "not available" and skip
+#   other   -> WARN and count as a failed call
+# Never aborts the export.
+# ---------------------------------------------------------------------------
+function Export-SimpleList {
+    param([string]$Label, [string]$Endpoint, [string]$OutFile)
+
+    $dir = Split-Path -Parent $OutFile
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    $script:TotalApiCalls++
+    $url = "$($script:DatadogApiUrl)$Endpoint"
+    $headers = @{
+        'DD-API-KEY'         = $script:DatadogApiKey
+        'DD-APPLICATION-KEY' = $script:DatadogAppKey
+        'Content-Type'       = 'application/json'
+    }
+    try {
+        $resp = Invoke-WebRequest -Uri $url -Method GET -Headers $headers `
+            -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
+        $script:SuccessfulApiCalls++
+        Write-JsonFile -Path $OutFile -Content $resp.Content
+        $n = Get-ListItemCount $resp.Content
+        if     ($n -eq '0') { Write-Log INFO    "  ${Label}: 0 (accessible, empty)" }
+        elseif ($n -eq '?') { Write-Log SUCCESS "  ${Label}: saved" }
+        else                { Write-Log SUCCESS "  ${Label}: $n" }
+    } catch {
+        $code = 0
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+        if     ($code -eq 401 -or $code -eq 403) { Write-Log WARNING "  ${Label}: skipped - Application Key missing required scope (HTTP $code)" }
+        elseif ($code -eq 404)                   { Write-Log INFO    "  ${Label}: not available on this org (HTTP 404)" }
+        else   { $script:FailedApiCalls++; Write-Log WARNING "  ${Label}: failed (HTTP $code)" }
+    }
+}
+
+# Export the full breadth of remaining single-call configuration resources.
+# Each is best-effort: empty or scope-gated resources are noted and skipped so
+# the script exports them automatically wherever the data/scopes exist.
+# Paths mirror bash export_additional_resources verbatim. Parity note: these are
+# intentionally NOT added to manifest.exported_items or -TestAccess (bash isn't).
+function Export-AdditionalResources {
+    Write-Step "Exporting Additional Resources"
+
+    $rows = @(
+        # Visualization & content
+        @{ L = 'Notebooks';                            E = '/api/v1/notebooks';                       O = 'notebooks/_list.json' }
+        @{ L = 'Dashboard lists';                      E = '/api/v1/dashboard/lists/manual';          O = 'dashboards/lists.json' }
+        @{ L = 'Powerpacks';                           E = '/api/v2/powerpacks';                      O = 'powerpacks/_list.json' }
+        # Monitoring extras
+        @{ L = 'SLO corrections';                      E = '/api/v1/slo/correction';                  O = 'slos/corrections.json' }
+        @{ L = 'Monitor config policies';              E = '/api/v2/monitor/policy';                  O = 'monitors/config_policies.json' }
+        # Logs (beyond pipelines/indexes)
+        @{ L = 'Log archives';                         E = '/api/v2/logs/config/archives';            O = 'logs/archives.json' }
+        @{ L = 'Log metrics';                          E = '/api/v2/logs/config/metrics';             O = 'logs/metrics.json' }
+        @{ L = 'Log custom destinations';              E = '/api/v2/logs/config/custom-destinations'; O = 'logs/custom_destinations.json' }
+        @{ L = 'Log restriction queries';              E = '/api/v2/logs/config/restriction_queries'; O = 'logs/restriction_queries.json' }
+        # APM / spans / RUM
+        @{ L = 'APM retention filters';                E = '/api/v2/apm/config/retention-filters';    O = 'apm/retention_filters.json' }
+        @{ L = 'Spans metrics';                        E = '/api/v2/apm/config/metrics';              O = 'apm/spans_metrics.json' }
+        @{ L = 'RUM applications';                     E = '/api/v2/rum/applications';                O = 'rum/applications.json' }
+        # Synthetics extras
+        @{ L = 'Synthetics global variables';          E = '/api/v1/synthetics/variables';            O = 'synthetics/global_variables.json' }
+        @{ L = 'Synthetics private locations';         E = '/api/v1/synthetics/locations';            O = 'synthetics/locations.json' }
+        # Security / catalog / reference
+        @{ L = 'Security monitoring rules';            E = '/api/v2/security_monitoring/rules';       O = 'security/monitoring_rules.json' }
+        @{ L = 'Service definitions (Software Catalog)'; E = '/api/v2/services/definitions';          O = 'service_catalog/definitions.json' }
+        @{ L = 'Reference tables';                     E = '/api/v2/reference-tables/tables';         O = 'reference_tables/_list.json' }
+        @{ L = 'Incidents';                            E = '/api/v2/incidents';                       O = 'incidents/_list.json' }
+        # Org / access
+        @{ L = 'Authn mappings';                       E = '/api/v2/authn_mappings';                  O = 'users/authn_mappings.json' }
+        # Integrations
+        @{ L = 'AWS integration';                      E = '/api/v1/integration/aws';                 O = 'integrations/aws.json' }
+        @{ L = 'Azure integration';                    E = '/api/v1/integration/azure';               O = 'integrations/azure.json' }
+        @{ L = 'GCP integration (legacy)';             E = '/api/v1/integration/gcp';                 O = 'integrations/gcp.json' }
+        @{ L = 'GCP integration (STS)';                E = '/api/v2/integration/gcp/accounts';        O = 'integrations/gcp_sts.json' }
+        @{ L = 'PagerDuty integration';                E = '/api/v1/integration/pagerduty';           O = 'integrations/pagerduty.json' }
+        # Infrastructure
+        @{ L = 'Host tags';                            E = '/api/v1/tags/hosts';                      O = 'infra/host_tags.json' }
+    )
+
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    foreach ($r in $rows) {
+        $out = Join-Path $script:OutputDir ($r.O -replace '/', $sep)
+        Export-SimpleList -Label $r.L -Endpoint $r.E -OutFile $out
     }
 }
 
@@ -1394,7 +1643,7 @@ function Main {
     Write-Log INFO "Export directory: $($script:OutputDir)"
     Write-Log INFO "================================"
 
-    $script:TotalSteps = 10
+    $script:TotalSteps = 11  # +1 for the Additional Resources step
     if ($script:SkipDashboardsF) { $script:TotalSteps-- }
     if ($script:SkipMonitorsF)   { $script:TotalSteps-- }
     if ($script:SkipLogsF)       { $script:TotalSteps-- }
@@ -1415,6 +1664,7 @@ function Main {
     Export-Metrics
     Export-Webhooks
     Export-UsersTeams
+    Export-AdditionalResources
     Invoke-UsageAnalytics
     Write-Manifest
     New-ExportArchive

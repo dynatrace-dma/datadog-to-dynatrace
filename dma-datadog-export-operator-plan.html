@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operator Plan — DMA DataDog Export (Windows + macOS)</title>
+<style>
+  :root { --bg:#0f1117; --card:#181b24; --ink:#e8eaf0; --muted:#9aa3b2; --accent:#6ea8fe; --hi:#ffd66e; --good:#5fd28a; --warn:#ff8a8a; --line:#272b36; }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:960px;margin:0 auto;padding:40px 24px 80px;}
+  header{border-bottom:1px solid var(--line);padding-bottom:20px;}
+  h1{font-size:27px;margin:0 0 6px;letter-spacing:-.3px;}
+  h2{font-size:21px;margin:38px 0 12px;padding-top:14px;border-top:1px solid var(--line);}
+  h3{font-size:17px;margin:22px 0 6px;color:var(--accent);}
+  .kicker{color:var(--hi);font-weight:700;font-size:12px;letter-spacing:1.2px;text-transform:uppercase;}
+  .meta{color:var(--muted);font-size:14px;}
+  .lede{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;padding:16px 20px;margin:22px 0;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:14px 0;}
+  a{color:var(--accent);text-decoration:none;} a:hover{text-decoration:underline;}
+  code{background:#0c0e14;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13.5px;}
+  pre{background:#0c0e14;border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow:auto;font-size:13px;line-height:1.5;margin:8px 0;}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14.5px;}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{color:var(--muted);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.4px;}
+  ul,ol{margin:8px 0;padding-left:22px;} li{margin:5px 0;}
+  footer{margin-top:46px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;}
+  /* utilities */
+  .phase{display:inline-block;min-width:26px;height:26px;line-height:26px;text-align:center;border-radius:6px;background:var(--accent);color:#0b0d12;font-weight:800;font-size:13px;margin-right:8px;}
+  .badge{display:inline-block;border-radius:5px;padding:0 8px;font-size:12px;font-weight:700;letter-spacing:.3px;}
+  .b-pass{background:rgba(95,210,138,.15);color:var(--good);border:1px solid rgba(95,210,138,.4);}
+  .b-warn{background:rgba(255,214,110,.13);color:var(--hi);border:1px solid rgba(255,214,110,.4);}
+  .b-fail{background:rgba(255,138,138,.13);color:var(--warn);border:1px solid rgba(255,138,138,.4);}
+  .os{display:inline-block;border-radius:5px;padding:0 7px;font-size:11px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;vertical-align:middle;}
+  .os-mac{background:rgba(110,168,254,.16);color:#9cc4ff;border:1px solid rgba(110,168,254,.4);}
+  .os-win{background:rgba(125,179,255,.10);color:#cdd9ff;border:1px solid rgba(125,179,255,.35);}
+  .gate{background:#12161f;border:1px solid var(--line);border-left:3px solid var(--hi);border-radius:8px;padding:12px 16px;margin:14px 0;}
+  .gate b{color:var(--hi);}
+  .danger{border-left:3px solid var(--warn);}
+  .danger b{color:var(--warn);}
+  .ok{color:var(--good);} .no{color:var(--warn);} .mut{color:var(--muted);}
+  .tight li{margin:2px 0;}
+  .nowrap{white-space:nowrap;}
+  .plat{font-weight:700;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:12px 0 2px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="kicker">Operator Runbook &middot; Dual-Platform</div>
+  <h1>DMA DataDog Export — Operator Plan</h1>
+  <div class="meta">Covers both <b>macOS/Linux</b> <code>dma-datadog-export.sh</code> and <b>Windows</b> <code>dma-datadog-export.ps1</code> &middot; v2.0.1 &middot; Prepared 2026-06-03</div>
+</header>
+
+<div class="lede">
+<b>Goal:</b> produce one <i>complete, verified</i> <code>.tar.gz</code> export of a DataDog org for ingestion into the DMA tooling — on the first real run. The biggest failure mode is <b>not</b> a crash: it is an export that <b>completes "successfully" but is silently missing data</b> because the Application Key lacked a scope (DataDog returns <code>200 OK</code> with empty results on most missing scopes). Both scripts are feature-equivalent for the core export — and now also for the concurrent detail-fetch and the best-effort <b>Additional Resources</b> pass (~25 extra config endpoints) — and share this plan; <span class="os os-mac">mac/Linux</span> and <span class="os os-win">Windows</span> tags mark where commands or behavior differ.
+</div>
+
+<div class="card">
+<b>The spine (8 phases, 3 gates):</b>
+<ol class="tight">
+<li><b>Phase 0</b> — Workstation &amp; inputs ready <span class="mut">(per-platform tooling)</span></li>
+<li><b>Phase 1</b> — Create credentials with the full scope set <span class="mut">&larr; root cause of most bad exports</span></li>
+<li><b>Phase 2</b> — Determine region / site</li>
+<li><b>Phase 3</b> — Access test &nbsp;<span class="gate" style="padding:1px 8px;margin:0;display:inline-block">GATE 1: zero FAILs (read the counts!)</span></li>
+<li><b>Phase 4</b> — Decide scope (skips, usage analytics, output)</li>
+<li><b>Phase 5</b> — Run the export</li>
+<li><b>Phase 6</b> — Verify completeness &nbsp;<span class="gate" style="padding:1px 8px;margin:0;display:inline-block">GATE 2: no silent-failure box + manifest sane</span></li>
+<li><b>Phase 7</b> — Usage analytics + manual UI supplements (if in scope)</li>
+<li><b>Phase 8</b> — Hand off the archive &nbsp;<span class="gate" style="padding:1px 8px;margin:0;display:inline-block">GATE 3: checksum verified</span></li>
+</ol>
+</div>
+
+<h3>Platform cheat-sheet (bash flag &harr; PowerShell parameter)</h3>
+<table>
+<tr><th>Purpose</th><th><span class="os os-mac">.sh</span> bash flag</th><th><span class="os os-win">.ps1</span> PowerShell parameter</th></tr>
+<tr><td>API key (required)</td><td><code>--api-key KEY</code></td><td><code>-ApiKey KEY</code></td></tr>
+<tr><td>Application key (required)</td><td><code>--app-key KEY</code></td><td><code>-AppKey KEY</code></td></tr>
+<tr><td>Region / site</td><td><code>--site us1</code></td><td><code>-Site us1</code></td></tr>
+<tr><td>Custom/mock API URL</td><td><code>--custom-url URL</code></td><td><code>-CustomUrl URL</code></td></tr>
+<tr><td>Output dir / name</td><td><code>--output DIR</code> / <code>--name N</code></td><td><code>-Output DIR</code> / <code>-Name N</code></td></tr>
+<tr><td>Skip categories</td><td><code>--skip-dashboards</code> … <code>--skip-users</code></td><td><code>-SkipDashboards</code> … <code>-SkipUsers</code></td></tr>
+<tr><td>Usage analytics</td><td><code>--usage</code> / <code>--usage-period 90d</code></td><td><code>-Usage</code> / <code>-UsagePeriod 90d</code></td></tr>
+<tr><td>Permission probe</td><td><code>--test-access</code></td><td><code>-TestAccess</code></td></tr>
+<tr><td>Verbose logging</td><td><code>--debug</code></td><td><code>-DebugMode</code></td></tr>
+<tr><td>Skip all prompts</td><td><span class="no">n/a</span> — just supply all 3 values <span class="mut">(<code>--non-interactive</code> is NOT implemented; it errors)</span></td><td><code>-NonInteractive</code> <span class="mut">(requires keys)</span></td></tr>
+<tr><td>Bypass TLS cert</td><td><span class="no">n/a</span></td><td><code>-SkipCertCheck</code> <span class="mut">(trusted nets only)</span></td></tr>
+<tr><td>Help</td><td><code>--help</code></td><td><code>-ShowHelp</code></td></tr>
+</table>
+
+<h2><span class="phase">0</span>Workstation &amp; inputs</h2>
+
+<h3>Tooling — differs by platform</h3>
+<div class="plat"><span class="os os-mac">macOS / Linux</span> — needs <code>curl</code>, <code>jq</code>, <code>tar</code> (script aborts on startup if any is missing). macOS ships curl + tar but <b>not jq</b>.</div>
+<pre>curl --version
+jq   --version      # if missing:  brew install jq    (Linux: apt-get install jq)
+tar  --version
+bash --version      # 3.2+ is fine (macOS default)</pre>
+<div class="plat"><span class="os os-win">Windows</span> — <b>zero external dependencies</b>: PowerShell 5.1+ (pre-installed) and <code>tar.exe</code> (built into Windows 10 build 1803+ / Windows 11). No curl or jq needed.</div>
+<pre>$PSVersionTable.PSVersion    # expect 5.1+
+tar --version                # built-in on Win10 1803+</pre>
+
+<h3>Gather these before you start (both platforms)</h3>
+<table>
+<tr><th>Input</th><th>Where / how</th></tr>
+<tr><td>DataDog <b>API Key</b></td><td>Org Settings &rarr; API Keys &rarr; New Key &nbsp;(<code>DD-API-KEY</code>)</td></tr>
+<tr><td>DataDog <b>Application Key</b></td><td>Org Settings &rarr; Application Keys &rarr; New Key &nbsp;(<code>DD-APPLICATION-KEY</code>) — <b>create fresh, scoped per Phase 1</b></td></tr>
+<tr><td><b>Site / region</b></td><td>Read it from the URL in your DataDog browser tab (Phase 2)</td></tr>
+<tr><td><b>Output location</b></td><td>A path with <b>500&nbsp;MB+ free</b> (data is written uncompressed, then tarred — needs room for both)</td></tr>
+<tr><td>Whether <b>usage analytics</b> are in scope</td><td>Decision in Phase 4; needs 2 extra scopes + much longer runtime</td></tr>
+</table>
+
+<h3>Make the script runnable (one-time)</h3>
+<div class="plat"><span class="os os-mac">macOS / Linux</span></div>
+<pre>cd datadog-to-dynatrace
+chmod +x dma-datadog-export.sh</pre>
+<span class="mut">If the file was edited/downloaded on Windows and you see <code>$'\r': command not found</code>, just run it once — it auto-converts its own CRLF line endings and re-executes.</span>
+<div class="plat"><span class="os os-win">Windows</span> — Windows blocks unsigned scripts by default, and files downloaded from the web are "blocked".</div>
+<pre>cd datadog-to-dynatrace
+Unblock-File .\dma-datadog-export.ps1
+# then run with a per-process bypass (does not change machine policy):
+powershell -ExecutionPolicy Bypass -File .\dma-datadog-export.ps1 -TestAccess</pre>
+<span class="mut">Or, in the session: <code>Set-ExecutionPolicy -Scope Process Bypass</code> then call <code>.\dma-datadog-export.ps1</code> directly.</span>
+
+<h2><span class="phase">1</span>Credentials &amp; scopes — the critical step <span class="mut">(identical on both platforms)</span></h2>
+
+<div class="card danger">
+<b>Why this is the whole ballgame:</b> many DataDog read endpoints return <code>200 OK</code> with an <b>empty list</b> when the Application Key lacks the scope — <i>not</i> a 403. So an export can finish green while silently dropping every dashboard, monitor, or SLO. The <code>/api/v1/validate</code> endpoint only checks the <b>API Key</b>, never the Application Key — so "credentials valid" tells you nothing about scopes. Treat the scope list below as mandatory.
+</div>
+
+<h3>Required Application Key scopes (always)</h3>
+<table>
+<tr><th>Scope</th><th>Unlocks</th><th>If missing</th></tr>
+<tr><td><code>dashboards_read</code></td><td>Dashboards</td><td>0 dashboards</td></tr>
+<tr><td><code>monitors_read</code></td><td>Monitors / alerts</td><td>0 monitors</td></tr>
+<tr><td><code>logs_read_config</code></td><td>Log pipelines &amp; indexes</td><td>0 pipelines</td></tr>
+<tr><td><code>synthetics_read</code></td><td>Synthetic tests</td><td>0 synthetics</td></tr>
+<tr><td><code>slos_read</code></td><td>SLOs</td><td>0 SLOs</td></tr>
+<tr><td><code>metrics_read</code></td><td>Metric metadata (active, last 24h)</td><td>0 metrics</td></tr>
+<tr><td><code>monitors_downtime</code></td><td>Downtimes</td><td>0 downtimes</td></tr>
+<tr><td><code>integrations_read</code></td><td>Webhook integrations</td><td>0 webhooks</td></tr>
+<tr><td><code>user_access_read</code></td><td>Users &amp; roles</td><td>0 users/roles</td></tr>
+<tr><td><code>teams_read</code></td><td>Teams</td><td>0 teams</td></tr>
+<tr><td><code>org_management</code></td><td>Org name / metadata</td><td>Org shows "Unknown" in manifest</td></tr>
+</table>
+
+<h3>Extra scopes — only if running usage analytics</h3>
+<table>
+<tr><th>Scope</th><th>Unlocks</th></tr>
+<tr><td><code>audit_trail_read</code></td><td>Monitor modifications (both); monitor triggers + dashboard-view events <span class="os os-mac">mac/Linux</span></td></tr>
+<tr><td><code>usage_read</code></td><td>Per-index log ingestion volume (Usage Metering v1)</td></tr>
+</table>
+<p class="mut">These fail <i>silently to empty analytics files</i> if absent — no error. <span class="os os-win">Windows</span> collects monitor triggers via the Events API instead of Audit Trail, so the API key also needs Events read for that one file (see Phase 7).</p>
+
+<h3>Scopes for the Additional Resources pass <span class="mut">(best-effort — do not chase these)</span></h3>
+<p>Both scripts also sweep ~25 extra single-call config endpoints (notebooks, powerpacks, log archives/metrics, APM retention filters, spans metrics, RUM apps, security monitoring rules, service catalog, reference tables, incidents, AWS/Azure/GCP/PagerDuty integrations, host tags, …). Each touches its own read scope (e.g. <code>apm_read</code>, <code>security_monitoring_rules_read</code>, <code>incident_read</code>, integration scopes).</p>
+<div class="gate"><b>Operationally these are non-fatal by design.</b> A missing scope (<code>401/403</code>) or an endpoint your org doesn't use (<code>404</code>) is <b>logged and skipped</b> — it does <i>not</i> fail the export, does <i>not</i> trip the silent-failure detector, and is <i>not</i> counted in the manifest. Treat <code>skipped — missing scope</code> / <code>not available</code> lines for these as informational; only chase one if migration scoping specifically needs that resource.</div>
+
+<h2><span class="phase">2</span>Region / site</h2>
+<p>Log into DataDog and read the browser URL. Pass the matching site value (<code>--site</code> / <code>-Site</code>). Both scripts accept a short code, a domain, or a full app URL and resolve the API host automatically (identical logic).</p>
+<table>
+<tr><th>Your DataDog URL</th><th>site value</th><th>Resolves to API</th></tr>
+<tr><td>app.datadoghq.com</td><td><code>app</code> or <code>us1</code> (default)</td><td>api.datadoghq.com</td></tr>
+<tr><td>us3.datadoghq.com</td><td><code>us3</code></td><td>api.us3.datadoghq.com</td></tr>
+<tr><td>us5.datadoghq.com</td><td><code>us5</code></td><td>api.us5.datadoghq.com</td></tr>
+<tr><td>app.datadoghq.eu</td><td><code>eu</code></td><td>api.datadoghq.eu</td></tr>
+<tr><td>ap1.datadoghq.com</td><td><code>ap1</code></td><td>api.ap1.datadoghq.com</td></tr>
+<tr><td>Dedicated cluster, e.g. <span class="nowrap">hx-eu.datadoghq.eu</span></td><td>paste the domain or full URL</td><td><span class="nowrap">api.hx-eu.datadoghq.eu</span></td></tr>
+</table>
+<div class="gate"><b>Dedicated-org trap (both):</b> some "dedicated" instances (custom domain like <code>hxp.datadoghq.com</code>) are isolated orgs <i>on shared US1 infrastructure</i>, not separate clusters. If <code>hxp</code> fails to connect, use site <code>app</code> — the API is the standard <code>api.datadoghq.com</code>. An unknown short code does <b>not</b> abort; the script warns and builds a guessed URL that then fails on every call. Phase 3 catches this.</div>
+<div class="plat"><span class="os os-win">Windows-only:</span> if a dedicated cluster's TLS cert isn't trusted by the Windows cert store (corporate CA / hostname mismatch), add <code>-SkipCertCheck</code> — trusted networks only. (PowerShell also force-enables TLS 1.2, since PS 5.1 defaults to 1.0/1.1.)</div>
+
+<h2><span class="phase">3</span>Access test &nbsp;<span class="badge b-warn">GATE 1</span></h2>
+<p><b>Always run the access test before the first real export.</b> It probes all export categories plus the 2 analytics APIs, writes nothing, prompts for any missing keys, and prints a results table. <b>It always exits 0</b> on both platforms — so in automation, parse the output, don't trust the exit code.</p>
+<div class="plat"><span class="os os-mac">macOS / Linux</span></div>
+<pre>./dma-datadog-export.sh --test-access                    # prompts for keys + site
+./dma-datadog-export.sh --api-key "&lt;API&gt;" --app-key "&lt;APP&gt;" --site app --test-access</pre>
+<div class="plat"><span class="os os-win">Windows</span></div>
+<pre>.\dma-datadog-export.ps1 -TestAccess
+.\dma-datadog-export.ps1 -ApiKey "&lt;API&gt;" -AppKey "&lt;APP&gt;" -Site app -TestAccess</pre>
+
+<h3>Reading the result — and a key platform difference</h3>
+<table>
+<tr><th>Result</th><th>Meaning</th><th>Action</th></tr>
+<tr><td><span class="badge b-pass">PASS</span></td><td><span class="os os-mac">mac/Linux</span> 200 <b>and</b> at least one item found.<br><span class="os os-win">Windows</span> 200 — <b>even with 0 items</b> (shows "<i>N found</i>").</td><td>Good on mac/Linux. On Windows, <b>read the count in the Detail column</b> — a green "PASS — 0 found" for a category you expect to have data is a red flag.</td></tr>
+<tr><td><span class="badge b-warn">WARN</span></td><td><span class="os os-mac">mac/Linux</span> 200 but 0 items, or 404.<br><span class="os os-win">Windows</span> optional/auth issue on analytics, Webhooks, or Teams.</td><td>OK only if you genuinely expect that category to be empty / aren't running <code>--usage</code>.</td></tr>
+<tr><td><span class="badge b-fail">FAIL</span></td><td>401/403 (scope/auth), no response, or unexpected code.</td><td>Must fix before exporting.</td></tr>
+</table>
+
+<div class="gate"><b>GATE 1 — do not proceed until:</b> zero FAIL rows, <b>and</b> every category you expect to contain data shows a non-zero count (on <span class="os os-win">Windows</span> verify the count, since 0-items still reads PASS). If usage analytics are planned, the two analytics rows must be PASS/WARN, not FAIL. Fix by re-creating the Application Key with the missing scopes (Phase 1) and re-testing.</div>
+
+<div class="card danger">
+<b>Quirks in the access test itself:</b>
+<ul class="tight">
+<li><b>Both:</b> exit code is always 0, even with FAIL rows — parse output for <code>FAIL</code> in CI.</li>
+<li><span class="os os-mac">mac/Linux only:</span> the <b>Webhooks</b> and <b>Teams</b> probes hit <i>different</i> endpoints than the real export, so an odd WARN on just those two isn't predictive — confirm them in the manifest after the run. <span class="mut">(On Windows these probes match the export endpoints, so they're trustworthy.)</span></li>
+<li><span class="os os-win">Windows:</span> if <b>Credentials</b> FAIL, the table aborts early and no other rows are shown — fix the keys first.</li>
+</ul>
+</div>
+
+<h2><span class="phase">4</span>Decide scope</h2>
+<table>
+<tr><th>Decision</th><th><span class="os os-mac">.sh</span> flags</th><th><span class="os os-win">.ps1</span> params</th><th>Guidance</th></tr>
+<tr><td>What to collect</td><td><code>--skip-dashboards</code>…<code>--skip-users</code></td><td><code>-SkipDashboards</code>…<code>-SkipUsers</code></td><td>Default is everything. Downtimes, webhooks, and the <b>Additional Resources</b> pass always run (no skip). Use skips to re-run one slow category or work around a scope you can't get yet.</td></tr>
+<tr><td>Concurrency caps</td><td colspan="2"><code>DASHBOARD_CONCURRENCY</code> (10) · <code>SYNTHETICS_CONCURRENCY</code> (10) · <code>LOGS_CONCURRENCY</code> (5) — env vars, both platforms</td><td>Dashboards/pipelines/synthetics details are fetched concurrently (bash <code>curl --parallel</code>; PowerShell runspace pool). Lower these if you hit sustained 429s on a constrained org.</td></tr>
+<tr><td>Usage analytics</td><td><code>--usage</code> / <code>--usage-period 90d</code></td><td><code>-Usage</code> / <code>-UsagePeriod 90d</code></td><td>Off by default. Adds the 2 audit/usage scopes and <b>dominates runtime</b>. See Phase 7.</td></tr>
+<tr><td>Output</td><td><code>--output DIR</code> / <code>--name N</code></td><td><code>-Output DIR</code> / <code>-Name N</code></td><td>Default <code>./datadog-export</code> + timestamped name. Point at a disk with 500&nbsp;MB+ free.</td></tr>
+</table>
+<p class="mut">Runtime ballpark (no usage): small org 2–5&nbsp;min, medium 10–20&nbsp;min, large 30–60&nbsp;min. With usage analytics, roughly 3–4&times; (Audit Trail pagination dominates). Detail-by-ID fetches (dashboards, pipelines, synthetics) run concurrently on both platforms, so large orgs finish much faster than a sequential pass; a 429 during the concurrent phase is retried with back-off, and list-level 429s are auto-retried (3 tries, 5/10/15s) — no action needed.</p>
+
+<h2><span class="phase">5</span>Run the export</h2>
+<p><b>Interactive</b> — recommended on shared hosts (keys aren't in shell history or <code>ps</code>). Both prompt only for values you don't supply.</p>
+<div class="plat"><span class="os os-mac">macOS / Linux</span></div>
+<pre>./dma-datadog-export.sh
+# prompts for API key, App key, and site; then runs</pre>
+<div class="plat"><span class="os os-win">Windows</span></div>
+<pre>.\dma-datadog-export.ps1
+# prompts for API key, App key, and site; auto-prompts to create the output dir if absent</pre>
+
+<p><b>Non-interactive</b> — automation / repeatable:</p>
+<div class="plat"><span class="os os-mac">macOS / Linux</span> — supply all three values; there is <b>no</b> <code>--non-interactive</code> flag (passing it errors out).</div>
+<pre>./dma-datadog-export.sh \
+  --api-key "&lt;API&gt;" --app-key "&lt;APP&gt;" \
+  --site app \
+  --output ~/dd-export \
+  --usage --usage-period 90d</pre>
+<div class="plat"><span class="os os-win">Windows</span> — use the explicit <code>-NonInteractive</code> switch (it requires keys, and auto-creates the output dir).</div>
+<pre>.\dma-datadog-export.ps1 `
+  -ApiKey "&lt;API&gt;" -AppKey "&lt;APP&gt;" `
+  -Site app `
+  -Output C:\dd-export `
+  -Usage -UsagePeriod 90d `
+  -NonInteractive</pre>
+
+<div class="card danger"><b>Credential hygiene (both):</b> in non-interactive mode the keys are passed as process arguments — visible in process listings (<code>ps aux</code> / Task Manager / <code>Get-CimInstance Win32_Process</code>) and your shell history, and neither script reads keys from environment variables. On a shared or CI host, prefer interactive mode, or use an ephemeral runner and <b>rotate the Application Key after the export</b>. Never commit keys to the repo.</div>
+
+<p>What you'll see (both): requirements check &rarr; credential validation (org name printed) &rarr; each core category (dashboards/pipelines/synthetics fetched <b>concurrently</b>, with a "max-parallel=N" line in <code>export.log</code>) &rarr; the <b>Exporting Additional Resources</b> step (a one-line PASS/skip per resource) &rarr; (usage analytics) &rarr; manifest &rarr; archive + checksum &rarr; an <b>Export Summary</b>. Individual category failures are logged and the run continues — so <b>"it finished" is not the same as "it's complete."</b> That's Phase 6. <span class="mut">Note: <code>skipped</code> / <code>not available</code> lines during the Additional Resources step are expected best-effort skips, not failures (Phase 1).</span></p>
+
+<h2><span class="phase">6</span>Verify completeness &nbsp;<span class="badge b-warn">GATE 2</span></h2>
+
+<div class="card danger"><b>Watch for the silent-failure banner (both platforms).</b> If any tracked category returned 200-but-zero, the script prints a <b>"⚠ POTENTIAL SILENT FAILURES DETECTED"</b> box at the end listing each empty category and its likely-missing scope. If you see it, the export is almost certainly incomplete — fix the scope (Phase 1), re-test (Phase 3), re-run. <span class="mut">The detector covers dashboards, monitors, log pipelines, synthetics, SLOs, metrics, and users — but not log indexes, downtimes, webhooks, roles, or teams, so still eyeball those counts in the manifest. The best-effort Additional Resources are deliberately outside the detector and the manifest <code>exported_items</code> totals — verify a specific one by listing its folder on disk (e.g. <code>integrations/</code>, <code>apm/</code>, <code>security/</code>) if migration scoping needs it.</span></div>
+
+<h3>Verification checklist</h3>
+<ol>
+<li><b>No silent-failure box</b> was printed (and the "Completed with N errors" count is acceptable).</li>
+<li><b>Inspect the manifest</b> — the authoritative record. Confirm <code>organization_name</code>/<code>id</code> is the <i>right org</i> (correct keys/region), <code>exported_items</code> counts are non-zero where you expect data, and <code>failed_api_calls</code> is low.
+<div class="plat"><span class="os os-mac">macOS / Linux</span></div>
+<pre>cd &lt;output&gt;/datadog-export-&lt;TIMESTAMP&gt;
+jq '.datadog_info, .export_statistics, .exported_items' manifest.json
+ls dashboards | head        # expect dashboard-&lt;id&gt;.json files, not just _list.json</pre>
+<div class="plat"><span class="os os-win">Windows</span></div>
+<pre>cd &lt;output&gt;\datadog-export-&lt;TIMESTAMP&gt;
+$m = Get-Content manifest.json -Raw | ConvertFrom-Json
+$m.datadog_info; $m.export_statistics; $m.exported_items
+Get-ChildItem dashboards | Select-Object -First 5</pre></li>
+<li><b>If usage analytics ran:</b> open <code>analytics/_summary.json</code> and confirm the per-query counts aren't all zero; check no file is error-only (Phase 7).</li>
+</ol>
+
+<div class="gate"><b>GATE 2 — the export is "good" when:</b> no silent-failure box, manifest org is correct, and every in-scope category has a plausible non-zero count with detail files on disk. Otherwise diagnose (Troubleshooting) and re-run.</div>
+
+<h2><span class="phase">7</span>Usage analytics &amp; manual supplements <span class="mut">(only if usage enabled)</span></h2>
+<p>With usage analytics on, the script writes an <code>analytics/</code> folder: <code>monitor_triggers.json</code>, <code>monitor_modifications.json</code>, <code>log_index_volume.json</code>, <code>unused_monitors.json</code>, <code>unused_dashboards.json</code>, <code>dashboard_views.json</code>, and <code>_summary.json</code>. Audit Trail is paginated (up to 20 pages × 1000 events), which is why usage runs are slow.</p>
+
+<div class="card danger">
+<b>Dashboard views are unreliable — plan to collect them manually.</b> The two scripts genuinely diverge here (the README's "feature-equivalent" claim does <i>not</i> hold for this one file):
+<ul class="tight">
+<li><span class="os os-mac">mac/Linux</span> queries the Audit Trail for <code>"Dashboard Viewed"</code> events and aggregates real view counts — <i>but only if your DataDog plan records those events</i>; otherwise the file is an empty array.</li>
+<li><span class="os os-win">Windows</span> always writes <code>{"error":"not_available"}</code> and never attempts it.</li>
+</ul>
+Either way, capture the <b>Dashboards &rarr; Popular Dashboards</b> list from the UI (screenshot — DataDog exposes no API/export for view counts) and share it with your DMA consultant.
+</div>
+
+<p>A second divergence to be aware of: <b>monitor triggers</b> come from the <b>Audit Trail</b> on <span class="os os-mac">mac/Linux</span> but the <b>Events API</b> on <span class="os os-win">Windows</span>. Both produce <code>monitor_triggers.json</code>; just note the Windows path needs Events read access, not strictly <code>audit_trail_read</code>. If a usage file is empty, gather the equivalent from the UI and hand it over with the archive:</p>
+<table>
+<tr><th>If empty…</th><th>Likely cause</th><th>UI fallback</th></tr>
+<tr><td><code>log_index_volume.json</code> <span class="mut">(<code>"error": "Usage Metering API not available"</code>)</span></td><td>missing <code>usage_read</code></td><td>Logs &rarr; "Log Management - Estimated Usage" dashboard, Indexed Logs section</td></tr>
+<tr><td><code>monitor_triggers.json</code></td><td>Audit/Events access missing</td><td>Events Explorer <code>sources:monitors</code> grouped by monitor</td></tr>
+<tr><td><code>monitor_modifications.json</code></td><td>missing <code>audit_trail_read</code></td><td>Org Settings &rarr; Audit Trail, <code>@asset.type:monitor</code></td></tr>
+<tr><td><code>dashboard_views.json</code></td><td>no API for view counts</td><td>Dashboards &rarr; Popular Dashboards (screenshot)</td></tr>
+</table>
+
+<h2><span class="phase">8</span>Hand off the archive &nbsp;<span class="badge b-warn">GATE 3</span></h2>
+<p>Outputs land at <code>&lt;output&gt;/&lt;name&gt;.tar.gz</code> with a sibling <code>&lt;name&gt;.tar.gz.sha256</code>. Verify integrity before uploading.</p>
+<div class="plat"><span class="os os-mac">macOS / Linux</span></div>
+<pre>cd &lt;output&gt;
+shasum -a 256 -c datadog-export-&lt;TIMESTAMP&gt;.tar.gz.sha256    # expect: OK</pre>
+<div class="plat"><span class="os os-win">Windows</span> <span class="mut">(no <code>-c</code> verify built in — compare hashes)</span></div>
+<pre>cd &lt;output&gt;
+$expected = (Get-Content datadog-export-&lt;TIMESTAMP&gt;.tar.gz.sha256).Split(' ')[0]
+$actual   = (Get-FileHash datadog-export-&lt;TIMESTAMP&gt;.tar.gz -Algorithm SHA256).Hash.ToLower()
+if ($actual -eq $expected) { "OK" } else { "MISMATCH" }</pre>
+<div class="gate"><b>GATE 3:</b> checksum matches and the archive size is plausible for the org. Then upload to the <b>DMA Curator Server</b> (recommended — full migration planning) or the <b>DMA DataDog App</b> (ad-hoc/smaller). The embedded <code>manifest.json</code> tells DMA which script version produced it and which categories are present. <span class="mut">(Both scripts' closing text says "DMA / DMP (DataDog Edition)" — confirm the exact target with your DMA contact.)</span></div>
+
+<h2>Troubleshooting quick reference</h2>
+<table>
+<tr><th>Symptom</th><th>Cause &rarr; Fix</th></tr>
+<tr><td>Export green but DMA shows no dashboards/monitors/etc.</td><td>Missing read scope (silent 200) &rarr; re-create App Key with all scopes, run access test, re-run</td></tr>
+<tr><td>Analytics tab empty</td><td>Missing <code>audit_trail_read</code>/<code>usage_read</code> &rarr; add both, re-run with usage enabled</td></tr>
+<tr><td>Credentials PASS but every export fails</td><td>App Key is wrong (validate only checks the API Key) &rarr; verify App Key separately</td></tr>
+<tr><td><code>Authentication failed (403)</code> during export</td><td>Wrong API or App Key &rarr; re-verify/regenerate both</td></tr>
+<tr><td>"Could not resolve host" / no response in access test</td><td>Wrong site, no internet, firewall/proxy, or guessed dedicated-cluster URL &rarr; confirm region; try site <code>app</code> or full domain/URL; set proxy</td></tr>
+<tr><td><span class="os os-mac">mac/Linux</span> <code>jq: command not found</code></td><td><code>brew install jq</code> (macOS) / <code>apt-get install jq</code> (Linux)</td></tr>
+<tr><td><span class="os os-mac">mac/Linux</span> <code>$'\r': command not found</code></td><td>CRLF line endings &rarr; run once; it self-converts and re-executes</td></tr>
+<tr><td><span class="os os-mac">mac/Linux</span> <code>Unknown option: --non-interactive</code></td><td>That flag isn't implemented in bash &rarr; just supply <code>--api-key</code>, <code>--app-key</code>, and <code>--site</code></td></tr>
+<tr><td><span class="os os-win">Windows</span> script won't run / "running scripts is disabled"</td><td>Execution policy &rarr; <code>Unblock-File</code> then <code>powershell -ExecutionPolicy Bypass -File .\dma-datadog-export.ps1 …</code></td></tr>
+<tr><td><span class="os os-win">Windows</span> "No response" to a known dedicated cluster</td><td>TLS cert not trusted &rarr; add <code>-SkipCertCheck</code> (trusted networks only)</td></tr>
+<tr><td><span class="os os-win">Windows</span> output landed in the wrong place</td><td>Old relative-path bug (fixed in 2.0.1) &rarr; use current version; relative <code>-Output</code> now resolves against your working dir</td></tr>
+<tr><td>Archive not created at the end</td><td><code>tar</code> failed, usually disk space &rarr; free 500&nbsp;MB+ or point output elsewhere</td></tr>
+<tr><td>Repeated <code>Rate limited (429)</code></td><td>Very large org &rarr; auto-retried; if persistent, run heavy categories separately (skip metrics/users first)</td></tr>
+<tr><td>Slow SLO / usage phase</td><td>Pagination (1000/page; audit up to 20 pages) &rarr; expected; let it run</td></tr>
+</table>
+<p class="mut">Add <code>--debug</code> / <code>-DebugMode</code> to log every API call (endpoint, HTTP code, body) to console and to <code>export.log</code> inside the archive.</p>
+
+<h2>Known doc-vs-script discrepancies (so they don't trip you up)</h2>
+<ul>
+<li><b>Dashboard views diverge across scripts</b> (documented in README.md and USAGE.md) — <span class="os os-mac">mac/Linux</span> attempts real Audit Trail data, <span class="os os-win">Windows</span> hardcodes <code>not_available</code>. Treat as best-effort; collect manually (Phase 7).</li>
+<li><b>Monitor triggers use different APIs</b> per platform — Audit Trail (<span class="os os-mac">mac/Linux</span>) vs Events API (<span class="os os-win">Windows</span>). Output file is the same; scope/access nuance differs.</li>
+<li><b><code>--non-interactive</code> does not exist in bash</b> — passing it errors. Only PowerShell has a real <code>-NonInteractive</code>; for bash, just supply the three required values.</li>
+<li><b>Access-test reading differs:</b> <span class="os os-mac">mac/Linux</span> downgrades a 200-with-0-items to WARN; <span class="os os-win">Windows</span> reports it as PASS "0 found." Always read the counts.</li>
+<li><b>Access-test exit code is always 0</b> on both, and on <span class="os os-mac">mac/Linux</span> the Webhooks/Teams probes use different endpoints than the export — verify those two in the manifest, not the access test.</li>
+<li><b>Usage-analytics APIs differ by platform</b> (now documented in README.md/USAGE.md): log index volume is Usage Metering <b>v1</b> on <span class="os os-mac">mac/Linux</span> vs <b>v2</b> on <span class="os os-win">Windows</span>; monitor triggers come from Audit Trail (<span class="os os-mac">mac/Linux</span>) vs the Events API (<span class="os os-win">Windows</span>). Functionally equivalent output.</li>
+</ul>
+
+<footer>
+Operator runbook for <code>dma-datadog-export.sh</code> (macOS/Linux) and <code>dma-datadog-export.ps1</code> (Windows), v2.0.1. Grounded in both script sources as of 2026-06-03, cross-checked against README.md and USAGE.md. Re-validate against the scripts if the version changes.
+</footer>
+</div>
+</body>
+</html>

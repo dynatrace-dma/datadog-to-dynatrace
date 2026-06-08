@@ -1,7 +1,7 @@
 # DMA DataDog Export Script
 
-**Version**: 2.0.0
-**Last Updated**: April 2026
+**Version**: 2.0.1
+**Last Updated**: June 2026
 
 > **Developed for Dynatrace One by Enterprise Solutions & Architecture**
 > *An ACE Services Division of Dynatrace*
@@ -17,7 +17,7 @@ Two export scripts are provided — choose the one that matches your environment
 | `dma-datadog-export.sh` | Linux, macOS, WSL | bash, curl, jq, tar |
 | `dma-datadog-export.ps1` | Windows (PowerShell 5.1+) | tar.exe (Windows 10 build 1803+) |
 
-Both scripts produce identical output archives and are feature-equivalent. The bash script is preferred on Linux/macOS; the PowerShell script is preferred on Windows.
+Both scripts produce the same output archive structure and are feature-equivalent for the core export. A few **usage-analytics** details differ by platform — see the platform-divergence note in [Opt-In: Usage Analytics](#opt-in-usage-analytics-default-off) below. The bash script is preferred on Linux/macOS; the PowerShell script is preferred on Windows.
 
 > **DataDog SaaS only.** DataDog does not offer self-hosted versions, so there is no on-premises variant of this script.
 
@@ -190,21 +190,44 @@ If you do not know your region, log into the DataDog UI and check the URL in you
 | **Webhooks** | v1 `/integration/webhooks` | Integration and notification migration |
 | **Users, Roles, Teams** | v2 `/users`, `/roles`, `/team` | Access control planning |
 
+Detail-heavy categories (dashboards, log pipelines, synthetic tests) are fetched **concurrently** — bash via `curl --parallel`, PowerShell via a runspace pool — with per-endpoint concurrency caps tuned to each endpoint's rate limit and automatic 429 back-off. Override the caps with the `DASHBOARD_CONCURRENCY` (default 10), `SYNTHETICS_CONCURRENCY` (10), and `LOGS_CONCURRENCY` (5) environment variables on either platform.
+
+### Additional Resources (defaults ON, best-effort)
+
+Beyond the core categories above, both scripts also collect the following single-call configuration resources. Each is **best-effort**: a resource gated by a missing scope (HTTP 401/403) or unavailable on the org (HTTP 404) is logged and skipped — never fatal, and never counted in the manifest item totals.
+
+| Group | Resources |
+|-------|-----------|
+| Content | Notebooks, Dashboard lists, Powerpacks |
+| Monitoring | SLO corrections, Monitor config policies |
+| Logs | Archives, Log metrics, Custom destinations, Restriction queries |
+| APM / RUM | APM retention filters, Spans metrics, RUM applications |
+| Synthetics | Global variables, Private locations |
+| Security / catalog | Security monitoring rules, Service definitions (Software Catalog), Reference tables, Incidents |
+| Org / access | Authn mappings |
+| Integrations | AWS, Azure, GCP (legacy + STS), PagerDuty |
+| Infrastructure | Host tags |
+
 ### Opt-In: Usage Analytics (default OFF)
 
 Enable with `--usage`. Requires `audit_trail_read` and `usage_read` scopes.
 
-| File | Source API | DMA Explorer Use |
-|------|-----------|-----------------|
-| `analytics/dashboard_views.json` | Audit Trail v2 | Dashboard view counts, unique users, last viewed |
-| `analytics/monitor_triggers.json` | Audit Trail v2 | Monitor trigger and resolve counts |
-| `analytics/log_index_volume.json` | Usage Metering v1 | Per-index daily event counts |
+| File | Source API (bash / PowerShell) | DMA Explorer Use |
+|------|--------------------------------|-----------------|
+| `analytics/dashboard_views.json` | Audit Trail v2 / *not collected* | Dashboard view counts (see note below) |
+| `analytics/monitor_triggers.json` | Audit Trail v2 / Events API v2 | Monitor trigger and resolve counts |
+| `analytics/log_index_volume.json` | Usage Metering v1 / Usage Metering v2 | Per-index event counts |
 | `analytics/monitor_modifications.json` | Audit Trail v2 | Monitor change history, modified-by |
-| `analytics/unused_dashboards.json` | Cross-reference | Dashboards with zero views in the usage period |
+| `analytics/unused_dashboards.json` | Cross-reference | Dashboards with zero views (only when view data is available) |
 | `analytics/unused_monitors.json` | Cross-reference | Monitors that never triggered in the usage period |
 | `analytics/_summary.json` | — | Aggregate counts for all of the above |
 
 The usage period defaults to 90 days. Override with `--usage-period 30d` or set the `USAGE_PERIOD` environment variable.
+
+> **Platform divergence in usage analytics.** Three files behave differently between the two scripts:
+> - **`dashboard_views.json`** — DataDog exposes no public API for per-dashboard view counts. The **bash** script attempts a best-effort proxy from Audit Trail `"Dashboard Viewed"` events (populated only if your DataDog plan records them; otherwise an empty array). The **PowerShell** script does not attempt this and always writes `{"error": "not_available"}`. Either way, collect the **Dashboards → Popular Dashboards** list from the UI manually — see [USAGE.md](USAGE.md).
+> - **`monitor_triggers.json`** — derived from the **Audit Trail v2** API (bash) vs. the **Events v2** API (PowerShell). The PowerShell path needs Events read access rather than `audit_trail_read` for this file.
+> - **`log_index_volume.json`** — collected via Usage Metering **v1** (`/api/v1/usage/logs_by_index`, bash) vs. **v2** (`/api/v2/usage/hourly_usage`, PowerShell).
 
 ### What Is NOT Collected
 
@@ -319,7 +342,7 @@ Provide all parameters on the command line — suitable for automation and CI/CD
 |------|------------|-------------|
 | `--test-access` | `-TestAccess` | Test credentials and permissions for all export categories, then exit. No data is written. Run this before every first export. |
 | `--debug` | `-DebugMode` | Enable verbose debug logging to console and log file |
-| `--non-interactive` | `-NonInteractive` | Skip all interactive prompts. Requires `--api-key` and `--app-key`. |
+| *(n/a)* | `-NonInteractive` | **PowerShell only.** Skip all interactive prompts (requires `-ApiKey` and `-AppKey`). The bash script has no `--non-interactive` flag — passing it errors. To run bash without prompts, simply supply `--api-key`, `--app-key`, and `--site`. |
 | *(n/a)* | `-SkipCertCheck` | **PowerShell only.** Disable SSL certificate validation. Use when connecting to a dedicated cluster whose certificate is not trusted by the Windows certificate store. Use only on trusted networks. |
 | `--help` | `-ShowHelp` | Show help and exit |
 
@@ -329,28 +352,39 @@ Provide all parameters on the command line — suitable for automation and CI/CD
 
 The script creates the following directory layout and then compresses it into a `.tar.gz` archive:
 
+Files marked **(additional)** come from the best-effort Additional Resources pass and are present only when the org has that data and the key has the scope.
+
 ```
 datadog-export/
 └── datadog-export-{TIMESTAMP}/
     ├── dashboards/
     │   ├── _list.json
-    │   └── dashboard-{id}.json
+    │   ├── dashboard-{id}.json
+    │   └── lists.json                  (additional — dashboard lists)
     ├── monitors/
     │   ├── _list.json
-    │   └── monitor-{id}.json
+    │   ├── monitor-{id}.json
+    │   └── config_policies.json        (additional)
     ├── logs/
     │   ├── pipelines/
     │   │   ├── _list.json
     │   │   └── pipeline-{id}.json
-    │   └── indexes/
-    │       ├── _list.json
-    │       └── index-{name}.json
+    │   ├── indexes/
+    │   │   ├── _list.json
+    │   │   └── index-{name}.json
+    │   ├── archives.json               (additional)
+    │   ├── metrics.json                (additional)
+    │   ├── custom_destinations.json    (additional)
+    │   └── restriction_queries.json    (additional)
     ├── synthetics/
     │   ├── _list.json
-    │   └── test-{public_id}.json
+    │   ├── test-{public_id}.json
+    │   ├── global_variables.json       (additional)
+    │   └── locations.json              (additional)
     ├── slos/
     │   ├── _list.json
-    │   └── slo-{id}.json
+    │   ├── slo-{id}.json
+    │   └── corrections.json            (additional)
     ├── downtimes/
     │   ├── _list.json
     │   └── downtime-{id}.json
@@ -362,7 +396,25 @@ datadog-export/
     ├── users/
     │   ├── users.json
     │   ├── roles.json
-    │   └── teams.json
+    │   ├── teams.json
+    │   └── authn_mappings.json         (additional)
+    ├── notebooks/_list.json            (additional)
+    ├── powerpacks/_list.json           (additional)
+    ├── apm/                            (additional)
+    │   ├── retention_filters.json
+    │   └── spans_metrics.json
+    ├── rum/applications.json           (additional)
+    ├── security/monitoring_rules.json  (additional)
+    ├── service_catalog/definitions.json (additional)
+    ├── reference_tables/_list.json     (additional)
+    ├── incidents/_list.json            (additional)
+    ├── integrations/                   (additional)
+    │   ├── aws.json
+    │   ├── azure.json
+    │   ├── gcp.json
+    │   ├── gcp_sts.json
+    │   └── pagerduty.json
+    ├── infra/host_tags.json            (additional)
     ├── analytics/              ← only present when --usage is set
     │   ├── _summary.json
     │   ├── dashboard_views.json
@@ -375,7 +427,7 @@ datadog-export/
     └── export.log
 ```
 
-The final archive is written to `{output}/{name}.tar.gz` alongside a SHA-256 checksum file (`{name}.tar.gz.sha256`). The `manifest.json` inside the archive records the script version, organization name and ID, item counts per category, API call statistics, and start/end timestamps.
+The final archive is written to `{output}/{name}.tar.gz` alongside a SHA-256 checksum file (`{name}.tar.gz.sha256`). The `manifest.json` inside the archive records the script version, organization name and ID, item counts per **core** category (the additional resources above are not tallied there), API call statistics, and start/end timestamps.
 
 ---
 
@@ -465,7 +517,7 @@ The `manifest.json` embedded in the archive tells the DMA Server which script ve
 - **TLS 1.2 enforcement (PowerShell)** — PowerShell 5.1 defaults to TLS 1.0/1.1; the script now enforces TLS 1.2 explicitly to support dedicated cluster endpoints
 - **`-SkipCertCheck` (PowerShell)** — new switch to bypass SSL certificate validation for dedicated clusters whose certificate is not trusted by the Windows certificate store
 - **Output directory validation (PowerShell)** — if the target output directory does not exist, the script prompts to create it rather than failing silently mid-export
-- **Relative path fix (PowerShell)** — relative `--output` paths (e.g., `../Test/Hyland`) are now resolved against PowerShell's working directory instead of the .NET runtime directory (`C:\Windows\`)
+- **Relative path fix (PowerShell)** — relative `--output` paths (e.g., `..\exports\my-org`) are now resolved against PowerShell's working directory instead of the .NET runtime directory (`C:\Windows\`)
 - **Improved error messages (PowerShell)** — network-level failures now report the actual exception message rather than `API call failed (0)`, making it easier to distinguish TLS errors, certificate failures, and connectivity problems
 
 ### v2.0.0 — REST API rewrite
