@@ -1818,8 +1818,12 @@ create_archive() {
     log INFO "Compressing export directory..."
     log INFO "Archive: $archive_name"
 
-    cd "$EXPORT_DIR"
-    if tar -czf "$archive_name" "$EXPORT_NAME" 2>&1 | tee -a "$LOG_FILE"; then
+    # NOTE: do not `cd "$EXPORT_DIR"` here. EXPORT_DIR may be relative (the
+    # default is ./datadog-export); changing the shell cwd would invalidate every
+    # other relative path used below ($LOG_FILE for tee, $archive_path for du /
+    # shasum / the .sha256 redirect), silently skipping the checksum step. Let
+    # tar change directories itself via -C so the shell cwd is left untouched.
+    if tar -czf "$archive_path" -C "$EXPORT_DIR" "$EXPORT_NAME" 2>&1 | tee -a "$LOG_FILE"; then
         local archive_size=$(du -h "$archive_path" | cut -f1)
         log SUCCESS "Archive created: $archive_name ($archive_size)"
 
