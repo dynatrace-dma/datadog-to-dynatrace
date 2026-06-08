@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     DMA DataDog Export Script v2.0.1 (PowerShell)
@@ -612,7 +612,8 @@ function Invoke-TestAccess {
     else       { Add-Result "Downtimes" "FAIL" (Format-AuthError $r.StatusCode) }
 
     # -- Metrics ---------------------------------------------------------------
-    $r = Test-ApiEndpoint "/api/v1/metrics"
+    $metricsFrom = [int]([datetime]::UtcNow - [datetime]::new(1970,1,1,0,0,0,[System.DateTimeKind]::Utc)).TotalSeconds - 86400
+    $r = Test-ApiEndpoint "/api/v1/metrics?from=$metricsFrom"
     if ($r.OK) { Add-Result "Metrics Metadata" "PASS" "$(@($r.Data.metrics).Count) active metrics" }
     else       { Add-Result "Metrics Metadata" "FAIL" (Format-AuthError $r.StatusCode) }
 
@@ -895,7 +896,8 @@ function Export-Metrics {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
     Write-Log INFO "Fetching active metrics list..."
-    $data = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/metrics" `
+    $metricsFrom = [int]([datetime]::UtcNow - [datetime]::new(1970,1,1,0,0,0,[System.DateTimeKind]::Utc)).TotalSeconds - 86400
+    $data = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/metrics?from=$metricsFrom" `
         -OutputFile (Join-Path $dir "_list.json")
     if ($data) {
         $count = if ($data.metrics) { $data.metrics.Count } else { 0 }
