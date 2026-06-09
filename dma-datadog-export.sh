@@ -31,10 +31,11 @@ fi
 #  ║                                                                           ║
 #  ║  □ 1. SYSTEM REQUIREMENTS (your local machine)                            ║
 #  ║     □ bash 3.2+        Run: bash --version (works on macOS default bash) ║
-#  ║     □ curl installed   Run: curl --version                                ║
-#  ║     □ jq installed     Run: jq --version (for JSON processing)            ║
-#  ║       └─ Install: brew install jq (macOS) or apt-get install jq (Linux)  ║
+#  ║     □ curl installed   Run: curl --version  (ships with macOS)            ║
+#  ║     □ awk installed    Run: awk --version   (POSIX awk; ships everywhere) ║
 #  ║     □ tar installed    Run: tar --version                                 ║
+#  ║     (jq is NOT required - JSON is parsed in pure bash/awk. jq is only     ║
+#  ║      used by --usage analytics; install it just for that optional mode.)  ║
 #  ║     □ Internet access to DataDog API endpoints                            ║
 #  ║                                                                           ║
 #  ║  □ 2. DATADOG API CREDENTIALS                                             ║
@@ -293,8 +294,11 @@ check_requirements() {
         missing_commands+=("curl")
     fi
 
-    if ! command_exists jq; then
-        missing_commands+=("jq")
+    # jq is NO LONGER required for the core export (replaced by the embedded
+    # pure-bash/awk JSON layer). It is still used by --usage analytics until that
+    # path is ported; that case is guarded separately (see below).
+    if ! command_exists awk; then
+        missing_commands+=("awk")
     fi
 
     if ! command_exists tar; then
@@ -306,6 +310,15 @@ check_requirements() {
         log ERROR "Install with: brew install ${missing_commands[*]} (macOS)"
         log ERROR "           or: apt-get install ${missing_commands[*]} (Linux)"
         return 1
+    fi
+
+    # Usage analytics (--usage) still depends on jq until that path is ported.
+    # If jq is absent, DISABLE analytics (rather than emit broken 0-byte files).
+    if [[ "$COLLECT_USAGE" == "true" ]] && ! command_exists jq; then
+        log WARNING "--usage analytics currently require 'jq', which is not installed."
+        log WARNING "Skipping usage analytics; the core export runs jq-free and is unaffected."
+        log WARNING "Install jq (brew install jq / apt-get install jq) to collect usage analytics."
+        COLLECT_USAGE=false
     fi
 
     return 0
@@ -438,6 +451,167 @@ dd_api_call() {
     return 1
 }
 
+# ===========================================================================
+# EMBEDDED JSON LAYER (no jq) — pure bash + POSIX awk.
+# Replaces jq for the core export. Helpers:
+#   json_split_array <arr>        one compacted top-level element per line
+#   json_len <arr>                count of top-level array elements (0 if not array)
+#   json_get <obj> <key>          raw (jq -r) value of a top-level object key
+#   json_get_raw <obj> <key>      still-encoded value token (for nested containers)
+#   json_pluck <arr> <field>      jq -r '.[]|.field'  (top-level field only)
+#   json_pluck_where <arr> <selK> <selV> <outF>   jq -r '.[]|select(.selK=="selV")|.outF'
+#   json_escape <str>             escape a raw string for JSON embedding (no quotes)
+#   uri_encode <str>              percent-encode for query strings (@uri)
+# Depth- and string-aware: nested same-named keys are never matched.
+# ===========================================================================
+
+# Top-level members of ONE JSON doc on stdin, whitespace-compacted:
+#   array  -> one element per line;  object -> "key"\t<value> per line.
+_json_members() {
+  awk '
+  { data = data $0 "\n" }
+  END {
+    L = length(data); i = 1
+    while (i <= L) { c = substr(data,i,1); if (c==" "||c=="\t"||c=="\n"||c=="\r") i++; else break }
+    if (i > L) exit
+    open = substr(data,i,1); if (open != "[" && open != "{") exit
+    i++; depth = 1; in_str = 0; esc = 0; member = ""
+    while (i <= L) {
+      c = substr(data,i,1)
+      if (in_str) { member = member c; if (esc) esc=0; else if (c=="\\") esc=1; else if (c=="\"") in_str=0; i++; continue }
+      if (c == "\"") { in_str=1; member=member c; i++; continue }
+      if (c==" "||c=="\t"||c=="\n"||c=="\r") { i++; continue }
+      if (c=="{"||c=="[") { depth++; member=member c; i++; continue }
+      if (c=="}"||c=="]") { depth--; if (depth==0){ flush(open,member); member=""; break } member=member c; i++; continue }
+      if (c=="," && depth==1) { flush(open,member); member=""; i++; continue }
+      member = member c; i++
+    }
+  }
+  function flush(o,m,   M,j,ch,instr,e,col) {
+    if (m=="") return
+    if (o=="[") { print m; return }
+    M=length(m); instr=0; e=0; col=0
+    for (j=1;j<=M;j++){ ch=substr(m,j,1)
+      if (instr){ if(e)e=0; else if(ch=="\\")e=1; else if(ch=="\"")instr=0; continue }
+      if (ch=="\""){ instr=1; continue }
+      if (ch==":"){ col=j; break } }
+    if (col==0) return
+    print substr(m,1,col-1) "\t" substr(m,col+1)
+  }
+  '
+}
+
+# Strip quotes + unescape a JSON string token (jq -r). Non-strings pass through.
+_json_unquote() {
+  awk '
+  { v = (NR==1) ? $0 : v "\n" $0 }   # no trailing newline (gawk/BSD sub($) differ)
+  END {
+    if (substr(v,1,1)!="\"") { printf "%s", v; exit }
+    s=substr(v,2,length(v)-2); L=length(s); i=1; out=""
+    while(i<=L){ c=substr(s,i,1)
+      if(c=="\\"&&i<L){ n=substr(s,i+1,1)
+        if(n=="n"){out=out "\n";i+=2;continue}
+        if(n=="t"){out=out "\t";i+=2;continue}
+        if(n=="r"){out=out "\r";i+=2;continue}
+        if(n=="/"){out=out "/";i+=2;continue}
+        if(n=="\\"){out=out "\\";i+=2;continue}
+        if(n=="\""){out=out "\"";i+=2;continue}
+        if(n=="u"){ hex=substr(s,i+2,4); code=hx(hex)
+          if(code>=0&&code<128){out=out sprintf("%c",code);i+=6;continue}
+          out=out "\\u" hex; i+=6; continue }
+        out=out n; i+=2; continue }
+      out=out c; i++ }
+    printf "%s", out }
+  function hx(h,   k,d,val,ch){ val=0
+    for(k=1;k<=length(h);k++){ ch=tolower(substr(h,k,1)); d=index("0123456789abcdef",ch)-1; if(d<0)return -1; val=val*16+d }
+    return val }
+  '
+}
+
+_json_pluck_awk='
+{ data = data $0 "\n" }
+END {
+  L=length(data); i=1
+  while(i<=L){c=substr(data,i,1); if(c==" "||c=="\t"||c=="\n"||c=="\r")i++; else break}
+  if(substr(data,i,1)!="[") exit
+  i++; depth=1; in_str=0; esc=0; elem=""
+  while(i<=L){ c=substr(data,i,1)
+    if(in_str){ elem=elem c; if(esc)esc=0; else if(c=="\\")esc=1; else if(c=="\"")in_str=0; i++; continue }
+    if(c=="\""){in_str=1; elem=elem c; i++; continue}
+    if(c==" "||c=="\t"||c=="\n"||c=="\r"){i++; continue}
+    if(c=="{"||c=="["){depth++; elem=elem c; i++; continue}
+    if(c=="}"||c=="]"){ depth--; if(depth==0){ handle(elem); elem=""; break } elem=elem c; i++; continue }
+    if(c==","&&depth==1){ handle(elem); elem=""; i++; continue }
+    elem=elem c; i++ }
+}
+function handle(e){ if(e=="") return
+  if(selk!=""){ if(unesc(objget(e,selk))!=selv) return }
+  print unesc(objget(e, field)) }
+function objget(e,k,   M,j,ch,instr,es,d,seg){ M=length(e); j=1
+  while(j<=M){ if(substr(e,j,1)=="{") break; j++ }
+  j++; d=1; instr=0; es=0; seg=""
+  while(j<=M){ ch=substr(e,j,1)
+    if(instr){ seg=seg ch; if(es)es=0; else if(ch=="\\")es=1; else if(ch=="\"")instr=0; j++; continue }
+    if(ch=="\""){instr=1; seg=seg ch; j++; continue}
+    if(ch=="{"||ch=="["){d++; seg=seg ch; j++; continue}
+    if(ch=="}"||ch=="]"){ d--; if(d==0){ if(segmatch(seg,k))return gval; seg=""; break } seg=seg ch; j++; continue }
+    if(ch==","&&d==1){ if(segmatch(seg,k))return gval; seg=""; j++; continue }
+    seg=seg ch; j++ }
+  return "" }
+function segmatch(seg,k,   M,j,ch,instr,es,col){ gval=""; if(seg=="") return 0
+  M=length(seg); instr=0; es=0; col=0
+  for(j=1;j<=M;j++){ ch=substr(seg,j,1)
+    if(instr){ if(es)es=0; else if(ch=="\\")es=1; else if(ch=="\"")instr=0; continue }
+    if(ch=="\""){instr=1; continue}
+    if(ch==":"){col=j; break} }
+  if(col==0) return 0
+  if(unesc(substr(seg,1,col-1))!=k) return 0
+  gval=substr(seg,col+1); return 1 }
+function unesc(v,   s,L,i,c,n,hex,code,out){ if(substr(v,1,1)!="\"") return v
+  s=substr(v,2,length(v)-2); L=length(s); i=1; out=""
+  while(i<=L){ c=substr(s,i,1)
+    if(c=="\\"&&i<L){ n=substr(s,i+1,1)
+      if(n=="n"){out=out "\n";i+=2;continue}
+      if(n=="t"){out=out "\t";i+=2;continue}
+      if(n=="r"){out=out "\r";i+=2;continue}
+      if(n=="/"){out=out "/";i+=2;continue}
+      if(n=="\\"){out=out "\\";i+=2;continue}
+      if(n=="\""){out=out "\"";i+=2;continue}
+      if(n=="u"){ hex=substr(s,i+2,4); code=hx(hex)
+        if(code>=0&&code<128){out=out sprintf("%c",code);i+=6;continue}
+        out=out "\\u" hex; i+=6; continue }
+      out=out n; i+=2; continue }
+    out=out c; i++ }
+  return out }
+function hx(h,   k,d,val,ch){ val=0
+  for(k=1;k<=length(h);k++){ ch=tolower(substr(h,k,1)); d=index("0123456789abcdef",ch)-1; if(d<0)return -1; val=val*16+d }
+  return val }
+'
+
+json_split_array() { printf '%s' "$1" | _json_members; }
+json_len() { local n; n=$(printf '%s' "$1" | _json_members | grep -c '' 2>/dev/null); [ -z "$n" ] && n=0; printf '%s' "$n"; }
+json_get_raw() { printf '%s' "$1" | _json_members | awk -F'\t' -v k="$2" '$1=="\""k"\""{print substr($0,length($1)+2); exit}'; }
+json_get() { json_get_raw "$1" "$2" | _json_unquote; }
+json_pluck() { printf '%s' "$1" | awk -v field="$2" "$_json_pluck_awk"; }
+json_pluck_where() { printf '%s' "$1" | awk -v selk="$2" -v selv="$3" -v field="$4" "$_json_pluck_awk"; }
+json_escape() {
+  printf '%s' "$1" | awk '
+  BEGIN { for (n=1;n<256;n++) ORD[sprintf("%c",n)]=n }
+  { if (NR>1) printf "\\n"; line=$0; L=length(line)
+    for (i=1;i<=L;i++){ c=substr(line,i,1)
+      if (c=="\\") printf "\\\\"; else if (c=="\"") printf "\\\""
+      else if (c=="\t") printf "\\t"; else if (c=="\r") printf "\\r"
+      else { d=(c in ORD)?ORD[c]:32; if (d<32) printf "\\u%04x", d; else printf "%s", c } } }
+  '
+}
+uri_encode() {
+  local s="$1" out="" i c
+  for (( i=0; i<${#s}; i++ )); do c=${s:$i:1}
+    case "$c" in [a-zA-Z0-9._~-]) out+="$c" ;; *) out+=$(printf '%%%02X' "'$c") ;; esac
+  done
+  printf '%s' "$out"
+}
+
 # ---------------------------------------------------------------------------
 # Concurrent fetch-by-ID using curl --parallel.
 #
@@ -554,10 +728,14 @@ export_simple_list() {
             cp "$tmp" "$out_file"
             # Count only when the candidate path is genuinely an array — avoids
             # the `null|length == 0` trap that mislabels non-.data shapes as empty.
-            local n=""
-            for p in '.data' '.dashboard_lists' '.variables' '.locations' '.notebooks' '.tags' '.accounts' '.'; do
-                n=$(jq -r "if (${p}|type)==\"array\" then (${p}|length) else empty end" "$tmp" 2>/dev/null)
-                [[ "$n" =~ ^[0-9]+$ ]] && break || n=""
+            local n="" p val body
+            body=$(cat "$tmp")
+            for p in data dashboard_lists variables locations notebooks tags accounts __ROOT__; do
+                if [ "$p" = "__ROOT__" ]; then val="$body"; else val=$(json_get_raw "$body" "$p"); fi
+                # only an array (first non-space char '[') is countable
+                case "$(printf '%s' "$val" | sed 's/^[[:space:]]*//' | cut -c1)" in
+                    '[') n=$(json_len "$val"); break ;;
+                esac
             done
             [ -z "$n" ] && n="?"
             if [ "$n" = "0" ]; then
@@ -641,9 +819,10 @@ validate_credentials() {
 
         # Try to get organization info
         if dd_api_call "GET" "/api/v1/org" "$temp_file"; then
-            if command_exists jq; then
-                DATADOG_ORG_NAME=$(jq -r '.org.name // "Unknown"' "$temp_file" 2>/dev/null)
-                DATADOG_ORG_ID=$(jq -r '.org.id // "Unknown"' "$temp_file" 2>/dev/null)
+            if true; then
+                local _org; _org=$(json_get_raw "$(cat "$temp_file")" org)
+                DATADOG_ORG_NAME=$(json_get "$_org" name); [ -z "$DATADOG_ORG_NAME" ] && DATADOG_ORG_NAME="Unknown"
+                DATADOG_ORG_ID=$(json_get "$_org" id);   [ -z "$DATADOG_ORG_ID" ] && DATADOG_ORG_ID="Unknown"
                 log INFO "Organization: $DATADOG_ORG_NAME"
                 log INFO "Organization ID: $DATADOG_ORG_ID"
             fi
@@ -683,22 +862,24 @@ export_dashboards() {
     local page_size=5000  # Maximum supported by DataDog API
     local all_dashboards="[]"
     local total_fetched=0
+    local elems_file=$(mktemp); : > "$elems_file"
 
     while true; do
         local temp_file=$(mktemp)
         local offset=$((page * page_size))
 
         if dd_api_call "GET" "/api/v1/dashboard?start=${offset}&count=${page_size}" "$temp_file"; then
-            local batch=$(jq '.dashboards' "$temp_file" 2>/dev/null || echo "[]")
-            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+            local batch=$(json_get_raw "$(cat "$temp_file")" dashboards)
+            [ -z "$batch" ] && batch="[]"
+            local batch_count=$(json_len "$batch")
 
             if [[ "$batch_count" -eq 0 ]]; then
                 rm -f "$temp_file"
                 break
             fi
 
-            # Merge with existing results
-            all_dashboards=$(jq -s '.[0] + .[1]' <(echo "$all_dashboards") <(echo "$batch"))
+            # Accumulate elements (no jq merge)
+            json_split_array "$batch" >> "$elems_file"
             total_fetched=$((total_fetched + batch_count))
 
             rm -f "$temp_file"
@@ -714,9 +895,11 @@ export_dashboards() {
         fi
     done
 
-    # Save complete list
+    # Build the full array from accumulated elements (no jq merge)
+    all_dashboards="[$(paste -sd, "$elems_file" 2>/dev/null)]"
+    rm -f "$elems_file"
     echo "{\"dashboards\": $all_dashboards}" > "$list_file"
-    local count=$(echo "$all_dashboards" | jq 'length' 2>/dev/null || echo "0")
+    local count=$(json_len "$all_dashboards")
 
     if [[ "$count" -eq 0 ]]; then
         track_empty_result "dashboards" "dashboards_read"
@@ -728,7 +911,7 @@ export_dashboards() {
         # Dashboards MUST be fetched individually: the list response carries
         # only metadata (no `widgets`). Rate limit (measured): 600/60s = 10/s.
         # Fetch concurrently; the helper self-paces via X-RateLimit-Reset.
-        local dashboard_ids=$(jq -r '.[]|.id' <(echo "$all_dashboards") 2>/dev/null)
+        local dashboard_ids=$(json_pluck "$all_dashboards" id)
 
         log INFO "Fetching $count dashboards concurrently (full widget definitions)..."
         echo "$dashboard_ids" | fetch_ids_concurrent "$DASHBOARD_CONCURRENCY" \
@@ -764,21 +947,22 @@ export_monitors() {
     local page_size=5000  # Maximum supported by DataDog API
     local all_monitors="[]"
     local total_fetched=0
+    local elems_file=$(mktemp); : > "$elems_file"
 
     while true; do
         local temp_file=$(mktemp)
 
         if dd_api_call "GET" "/api/v1/monitor?page=${page}&page_size=${page_size}" "$temp_file"; then
             local batch=$(cat "$temp_file" 2>/dev/null || echo "[]")
-            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+            local batch_count=$(json_len "$batch")
 
             if [[ "$batch_count" -eq 0 ]]; then
                 rm -f "$temp_file"
                 break
             fi
 
-            # Merge with existing results
-            all_monitors=$(jq -s '.[0] + .[1]' <(echo "$all_monitors") <(echo "$batch"))
+            # Accumulate elements (no jq merge)
+            json_split_array "$batch" >> "$elems_file"
             total_fetched=$((total_fetched + batch_count))
 
             rm -f "$temp_file"
@@ -794,9 +978,11 @@ export_monitors() {
         fi
     done
 
-    # Save complete list
+    # Build the full array from accumulated elements (no jq merge)
+    all_monitors="[$(paste -sd, "$elems_file" 2>/dev/null)]"
+    rm -f "$elems_file"
     echo "$all_monitors" > "$list_file"
-    local count=$(echo "$all_monitors" | jq 'length' 2>/dev/null || echo "0")
+    local count=$(json_len "$all_monitors")
 
     if [[ "$count" -eq 0 ]]; then
         track_empty_result "monitors" "monitors_read"
@@ -813,13 +999,13 @@ export_monitors() {
         log INFO "Extracting individual monitor files from list..."
 
         local current=0
-        jq -c '.[]' "$list_file" 2>/dev/null | while IFS= read -r monitor_json; do
+        json_split_array "$all_monitors" | while IFS= read -r monitor_json; do
             current=$((current + 1))
             show_progress $current $count
 
-            local monitor_id=$(echo "$monitor_json" | jq -r '.id')
+            local monitor_id=$(json_get "$monitor_json" id)
             local output_file="$monitors_dir/monitor-${monitor_id}.json"
-            echo "$monitor_json" | jq '.' > "$output_file"
+            printf '%s' "$monitor_json" > "$output_file"
         done
 
         echo ""  # New line after progress bar
@@ -847,7 +1033,7 @@ export_logs_config() {
     local pipelines_list="$logs_dir/pipelines/_list.json"
 
     if dd_api_call "GET" "/api/v1/logs/config/pipelines" "$pipelines_list"; then
-        local count=$(jq '. | length' "$pipelines_list" 2>/dev/null || echo "0")
+        local count=$(json_len "$(cat "$pipelines_list")")
 
         if [[ "$count" -eq 0 ]]; then
             track_empty_result "log pipelines" "logs_read_config"
@@ -857,7 +1043,7 @@ export_logs_config() {
 
         if [[ "$count" -gt 0 ]]; then
             # Pipelines fetched individually (measured limit 420/60s = 7/s).
-            local pipeline_ids=$(jq -r '.[].id' "$pipelines_list" 2>/dev/null)
+            local pipeline_ids=$(json_pluck "$(cat "$pipelines_list")" id)
 
             log INFO "Fetching $count log pipelines concurrently..."
             echo "$pipeline_ids" | fetch_ids_concurrent "$LOGS_CONCURRENCY" \
@@ -874,12 +1060,12 @@ export_logs_config() {
     local indexes_list="$logs_dir/indexes/_list.json"
 
     if dd_api_call "GET" "/api/v1/logs/config/indexes" "$indexes_list"; then
-        local count=$(jq '.indexes | length' "$indexes_list" 2>/dev/null || echo "0")
+        local count=$(json_len "$(json_get_raw "$(cat "$indexes_list")" indexes)")
         log SUCCESS "Found $count log indexes"
 
         if [[ "$count" -gt 0 ]]; then
             # Extract individual indexes
-            local index_names=$(jq -r '.indexes[].name' "$indexes_list" 2>/dev/null)
+            local index_names=$(json_pluck "$(json_get_raw "$(cat "$indexes_list")" indexes)" name)
 
             local current=0
             while IFS= read -r index_name; do
@@ -920,20 +1106,22 @@ export_synthetics() {
     local page=0
     local page_size=5000  # Maximum supported by DataDog API
     local all_tests="[]"
+    local elems_file=$(mktemp); : > "$elems_file"
 
     while true; do
         local temp_file=$(mktemp)
 
         if dd_api_call "GET" "/api/v1/synthetics/tests?page=${page}&page_size=${page_size}" "$temp_file"; then
-            local batch=$(jq '.tests' "$temp_file" 2>/dev/null || echo "[]")
-            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+            local batch=$(json_get_raw "$(cat "$temp_file")" tests)
+            [ -z "$batch" ] && batch="[]"
+            local batch_count=$(json_len "$batch")
 
             if [[ "$batch_count" -eq 0 ]]; then
                 rm -f "$temp_file"
                 break
             fi
 
-            all_tests=$(jq -s '.[0] + .[1]' <(echo "$all_tests") <(echo "$batch"))
+            json_split_array "$batch" >> "$elems_file"
             rm -f "$temp_file"
             page=$((page + 1))
 
@@ -947,8 +1135,10 @@ export_synthetics() {
         fi
     done
 
+    all_tests="[$(paste -sd, "$elems_file" 2>/dev/null)]"
+    rm -f "$elems_file"
     echo "{\"tests\": $all_tests}" > "$list_file"
-    local count=$(echo "$all_tests" | jq 'length' 2>/dev/null || echo "0")
+    local count=$(json_len "$all_tests")
 
     if [[ "$count" -eq 0 ]]; then
         track_empty_result "synthetic tests" "synthetics_read"
@@ -961,16 +1151,16 @@ export_synthetics() {
         # API tests, so write every test straight from the list — no per-test
         # fetch needed for the 80%+ that are API tests.
         log INFO "Writing $count synthetic tests from list..."
-        jq -c '.[]' <(echo "$all_tests") 2>/dev/null | while IFS= read -r t; do
-            local pid=$(echo "$t" | jq -r '.public_id')
-            echo "$t" | jq '.' > "$synthetics_dir/test-${pid}.json"
+        json_split_array "$all_tests" | while IFS= read -r t; do
+            local pid=$(json_get "$t" public_id)
+            printf '%s' "$t" > "$synthetics_dir/test-${pid}.json"
         done
 
         # Browser tests are the exception: their `steps` are NOT in the list
         # config and only come from /synthetics/tests/browser/{id}. Fetch those
         # concurrently (measured limit 1450/60s = 24/s) and overwrite the
         # list-derived file with the steps-included full object.
-        local browser_ids=$(jq -r '.[] | select(.type=="browser") | .public_id' <(echo "$all_tests") 2>/dev/null)
+        local browser_ids=$(json_pluck_where "$all_tests" type browser public_id)
         local browser_count=$(printf '%s\n' "$browser_ids" | grep -c '[^[:space:]]')
 
         if [[ "$browser_count" -gt 0 ]]; then
@@ -1005,18 +1195,21 @@ export_slos() {
     local offset=0
     local limit=1000
     local all_slos="[]"
+    local elems_file=$(mktemp); : > "$elems_file"
 
     while true; do
         local temp_file=$(mktemp)
         if dd_api_call "GET" "/api/v1/slo?offset=${offset}&limit=${limit}" "$temp_file"; then
-            local batch_count=$(jq '.data | length' "$temp_file" 2>/dev/null || echo "0")
+            local batch=$(json_get_raw "$(cat "$temp_file")" data)
+            [ -z "$batch" ] && batch="[]"
+            local batch_count=$(json_len "$batch")
 
             if [[ "$batch_count" -eq 0 ]]; then
                 break
             fi
 
-            # Merge with existing results
-            all_slos=$(jq -s '.[0] + .[1].data' <(echo "$all_slos") "$temp_file")
+            # Accumulate elements (no jq merge)
+            json_split_array "$batch" >> "$elems_file"
 
             offset=$((offset + limit))
             rm -f "$temp_file"
@@ -1031,9 +1224,11 @@ export_slos() {
         fi
     done
 
-    # Save complete list
+    # Build the full array from accumulated elements (no jq merge)
+    all_slos="[$(paste -sd, "$elems_file" 2>/dev/null)]"
+    rm -f "$elems_file"
     echo "{\"data\": $all_slos}" > "$list_file"
-    local count=$(echo "$all_slos" | jq '. | length' 2>/dev/null || echo "0")
+    local count=$(json_len "$all_slos")
 
     if [[ "$count" -eq 0 ]]; then
         track_empty_result "SLOs" "slos_read"
@@ -1043,7 +1238,7 @@ export_slos() {
 
     if [[ "$count" -gt 0 ]]; then
         # Extract individual SLOs
-        local slo_ids=$(echo "$all_slos" | jq -r '.[].id' 2>/dev/null)
+        local slo_ids=$(json_pluck "$all_slos" id)
 
         local current=0
         while IFS= read -r slo_id; do
@@ -1076,20 +1271,22 @@ export_downtimes() {
     local offset=0
     local limit=1000  # Maximum supported by v2 API
     local all_downtimes="[]"
+    local elems_file=$(mktemp); : > "$elems_file"
 
     while true; do
         local temp_file=$(mktemp)
 
         if dd_api_call "GET" "/api/v2/downtime?page%5Blimit%5D=${limit}&page%5Boffset%5D=${offset}" "$temp_file"; then
-            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
-            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
+            local batch=$(json_get_raw "$(cat "$temp_file")" data)
+            [ -z "$batch" ] && batch="[]"
+            local batch_count=$(json_len "$batch")
 
             if [[ "$batch_count" -eq 0 ]]; then
                 rm -f "$temp_file"
                 break
             fi
 
-            all_downtimes=$(jq -s '.[0] + .[1]' <(echo "$all_downtimes") <(echo "$batch"))
+            json_split_array "$batch" >> "$elems_file"
             rm -f "$temp_file"
             offset=$((offset + limit))
 
@@ -1103,8 +1300,10 @@ export_downtimes() {
         fi
     done
 
+    all_downtimes="[$(paste -sd, "$elems_file" 2>/dev/null)]"
+    rm -f "$elems_file"
     echo "{\"data\": $all_downtimes}" > "$list_file"
-    local count=$(echo "$all_downtimes" | jq 'length' 2>/dev/null || echo "0")
+    local count=$(json_len "$all_downtimes")
     log SUCCESS "Found $count downtimes"
 
     if [[ "$count" -gt 0 ]]; then
@@ -1112,9 +1311,9 @@ export_downtimes() {
         # list .attributes == GET /downtime/{id} .attributes), so write each
         # downtime straight from the list — no per-ID fetch required.
         log INFO "Writing $count downtimes from list..."
-        jq -c '.[]' <(echo "$all_downtimes") 2>/dev/null | while IFS= read -r dt; do
-            local dtid=$(echo "$dt" | jq -r '.id')
-            echo "$dt" | jq '.' > "$downtimes_dir/downtime-${dtid}.json"
+        json_split_array "$all_downtimes" | while IFS= read -r dt; do
+            local dtid=$(json_get "$dt" id)
+            printf '%s' "$dt" > "$downtimes_dir/downtime-${dtid}.json"
         done
         log SUCCESS "Exported $count downtimes"
     fi
@@ -1141,7 +1340,7 @@ export_metrics() {
     local from_ts=$(date -u -v-1d "+%s" 2>/dev/null || date -u -d "1 day ago" "+%s" 2>/dev/null)
 
     if dd_api_call "GET" "/api/v1/metrics?from=${from_ts}" "$list_file"; then
-        local count=$(jq '.metrics | length' "$list_file" 2>/dev/null || echo "0")
+        local count=$(json_len "$(json_get_raw "$(cat "$list_file")" metrics)")
 
         if [[ "$count" -eq 0 ]]; then
             track_empty_result "metrics" "metrics_read"
@@ -1170,12 +1369,12 @@ export_webhooks() {
     local list_file="$webhooks_dir/_list.json"
 
     if dd_api_call "GET" "/api/v1/integration/webhooks/configuration/webhooks" "$list_file"; then
-        local count=$(jq '. | length' "$list_file" 2>/dev/null || echo "0")
+        local count=$(json_len "$(cat "$list_file")")
         log SUCCESS "Found $count webhooks"
 
         if [[ "$count" -gt 0 ]]; then
             # Extract webhook names
-            local webhook_names=$(jq -r '.[].name' "$list_file" 2>/dev/null)
+            local webhook_names=$(json_pluck "$(cat "$list_file")" name)
 
             local current=0
             while IFS= read -r webhook_name; do
@@ -1210,41 +1409,36 @@ export_users_teams() {
     local users_dir="$OUTPUT_DIR/users"
     mkdir -p "$users_dir"
 
+    # Helper: paginate a v2 {"data":[...]} endpoint into ELEMS_OUT (no jq merge).
+    # $1 = url template with __N__ for page number; $2 = page size; sets PAGED_ARRAY
+    _paginate_data() {
+        local url_tmpl="$1" psize="$2" pnum=0 ef
+        ef=$(mktemp); : > "$ef"
+        while true; do
+            local tf=$(mktemp)
+            if dd_api_call "GET" "${url_tmpl//__N__/$pnum}" "$tf"; then
+                local b bc
+                b=$(json_get_raw "$(cat "$tf")" data); [ -z "$b" ] && b="[]"
+                bc=$(json_len "$b")
+                if [[ "$bc" -eq 0 ]]; then rm -f "$tf"; break; fi
+                json_split_array "$b" >> "$ef"
+                rm -f "$tf"; pnum=$((pnum + 1))
+                [[ "$bc" -lt "$psize" ]] && break
+            else
+                log WARNING "Failed to fetch page $pnum"; rm -f "$tf"; break
+            fi
+        done
+        PAGED_ARRAY="[$(paste -sd, "$ef" 2>/dev/null)]"
+        rm -f "$ef"
+    }
+
     # Export users (paginated)
     log INFO "Fetching users (paginated)..."
     local users_file="$users_dir/users.json"
-    local page_number=0
     local page_size=1000  # Maximum supported by v2 API
-    local all_users="[]"
-
-    while true; do
-        local temp_file=$(mktemp)
-        if dd_api_call "GET" "/api/v2/users?page%5Bsize%5D=${page_size}&page%5Bnumber%5D=${page_number}" "$temp_file"; then
-            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
-            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
-
-            if [[ "$batch_count" -eq 0 ]]; then
-                rm -f "$temp_file"
-                break
-            fi
-
-            all_users=$(jq -s '.[0] + .[1]' <(echo "$all_users") <(echo "$batch"))
-            rm -f "$temp_file"
-            page_number=$((page_number + 1))
-
-            if [[ "$batch_count" -lt "$page_size" ]]; then
-                break
-            fi
-        else
-            log WARNING "Failed to fetch users at page $page_number"
-            rm -f "$temp_file"
-            break
-        fi
-    done
-
-    echo "{\"data\": $all_users}" > "$users_file"
-    local count=$(echo "$all_users" | jq 'length' 2>/dev/null || echo "0")
-
+    _paginate_data "/api/v2/users?page%5Bsize%5D=${page_size}&page%5Bnumber%5D=__N__" "$page_size"
+    echo "{\"data\": $PAGED_ARRAY}" > "$users_file"
+    local count=$(json_len "$PAGED_ARRAY")
     if [[ "$count" -eq 0 ]]; then
         track_empty_result "users" "user_access_read"
     else
@@ -1254,72 +1448,18 @@ export_users_teams() {
     # Export roles (paginated)
     log INFO "Fetching roles (paginated)..."
     local roles_file="$users_dir/roles.json"
-    page_number=0
     local roles_page_size=100  # v2 roles API rejects page sizes above 100
-    local all_roles="[]"
-
-    while true; do
-        local temp_file=$(mktemp)
-        if dd_api_call "GET" "/api/v2/roles?page%5Bsize%5D=${roles_page_size}&page%5Bnumber%5D=${page_number}" "$temp_file"; then
-            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
-            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
-
-            if [[ "$batch_count" -eq 0 ]]; then
-                rm -f "$temp_file"
-                break
-            fi
-
-            all_roles=$(jq -s '.[0] + .[1]' <(echo "$all_roles") <(echo "$batch"))
-            rm -f "$temp_file"
-            page_number=$((page_number + 1))
-
-            if [[ "$batch_count" -lt "$page_size" ]]; then
-                break
-            fi
-        else
-            log WARNING "Failed to fetch roles at page $page_number"
-            rm -f "$temp_file"
-            break
-        fi
-    done
-
-    echo "{\"data\": $all_roles}" > "$roles_file"
-    local count=$(echo "$all_roles" | jq 'length' 2>/dev/null || echo "0")
+    _paginate_data "/api/v2/roles?page%5Bsize%5D=${roles_page_size}&page%5Bnumber%5D=__N__" "$roles_page_size"
+    echo "{\"data\": $PAGED_ARRAY}" > "$roles_file"
+    count=$(json_len "$PAGED_ARRAY")
     log SUCCESS "Exported $count roles"
 
     # Export teams (paginated)
     log INFO "Fetching teams (paginated)..."
     local teams_file="$users_dir/teams.json"
-    page_number=0
-    local all_teams="[]"
-
-    while true; do
-        local temp_file=$(mktemp)
-        if dd_api_call "GET" "/api/v2/team?page%5Bsize%5D=${page_size}&page%5Bnumber%5D=${page_number}" "$temp_file"; then
-            local batch=$(jq '.data' "$temp_file" 2>/dev/null || echo "[]")
-            local batch_count=$(echo "$batch" | jq 'length' 2>/dev/null || echo "0")
-
-            if [[ "$batch_count" -eq 0 ]]; then
-                rm -f "$temp_file"
-                break
-            fi
-
-            all_teams=$(jq -s '.[0] + .[1]' <(echo "$all_teams") <(echo "$batch"))
-            rm -f "$temp_file"
-            page_number=$((page_number + 1))
-
-            if [[ "$batch_count" -lt "$page_size" ]]; then
-                break
-            fi
-        else
-            log WARNING "Failed to fetch teams at page $page_number"
-            rm -f "$temp_file"
-            break
-        fi
-    done
-
-    echo "{\"data\": $all_teams}" > "$teams_file"
-    local count=$(echo "$all_teams" | jq 'length' 2>/dev/null || echo "0")
+    _paginate_data "/api/v2/team?page%5Bsize%5D=${page_size}&page%5Bnumber%5D=__N__" "$page_size"
+    echo "{\"data\": $PAGED_ARRAY}" > "$teams_file"
+    count=$(json_len "$PAGED_ARRAY")
     log SUCCESS "Exported $count teams"
 
     return 0
@@ -1734,22 +1874,31 @@ generate_manifest() {
     local downtime_count=$(find "$OUTPUT_DIR/downtimes" -name "downtime-*.json" 2>/dev/null | wc -l | tr -d ' ')
     local webhook_count=$(find "$OUTPUT_DIR/webhooks" -name "webhook-*.json" 2>/dev/null | wc -l | tr -d ' ')
 
+    # JSON-escape free-text / API-derived fields so quotes, backslashes, and
+    # unicode in the org name (etc.) can't corrupt the manifest.
+    local esc_export_name esc_site esc_api_url esc_org_name esc_org_id
+    esc_export_name=$(json_escape "$EXPORT_NAME")
+    esc_site=$(json_escape "$DATADOG_SITE")
+    esc_api_url=$(json_escape "$DATADOG_API_URL")
+    esc_org_name=$(json_escape "$DATADOG_ORG_NAME")
+    esc_org_id=$(json_escape "$DATADOG_ORG_ID")
+
     cat > "$manifest_file" <<EOF
 {
   "export_info": {
     "script_name": "$SCRIPT_NAME",
     "script_version": "$SCRIPT_VERSION",
-    "export_name": "$EXPORT_NAME",
+    "export_name": "$esc_export_name",
     "export_timestamp": "$TIMESTAMP",
     "start_time": "$START_TIME",
     "end_time": "$end_time",
     "duration_seconds": $duration
   },
   "datadog_info": {
-    "site": "$DATADOG_SITE",
-    "api_url": "$DATADOG_API_URL",
-    "organization_name": "$DATADOG_ORG_NAME",
-    "organization_id": "$DATADOG_ORG_ID"
+    "site": "$esc_site",
+    "api_url": "$esc_api_url",
+    "organization_name": "$esc_org_name",
+    "organization_id": "$esc_org_id"
   },
   "export_statistics": {
     "total_api_calls": $TOTAL_API_CALLS,
@@ -1863,13 +2012,19 @@ probe_endpoint() {
 }
 
 # Classify HTTP code + body into PASS / WARN / FAIL.
-# $1 = http code, $2 = response body, $3 = jq expression returning item count
+# $1 = http code, $2 = response body, $3 = count token (no jq):
+#   @valid | @org | @root | @key:<name>
 classify_probe() {
-    local code="$1" body="$2" jq_expr="$3"
+    local code="$1" body="$2" tok="$3"
     case "$code" in
         200|201)
-            local count
-            count=$(echo "$body" | jq "$jq_expr" 2>/dev/null)
+            local count=0
+            case "$tok" in
+                @valid) [ "$(json_get_raw "$body" valid)" = "true" ] && count=1 ;;
+                @org)   [ -n "$(json_get_raw "$body" org)" ] && count=1 ;;
+                @root)  count=$(json_len "$body") ;;
+                @key:*) count=$(json_len "$(json_get_raw "$body" "${tok#@key:}")") ;;
+            esac
             if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]; then
                 echo "PASS"
             else
@@ -1937,22 +2092,22 @@ run_test_access() {
     # Compute timestamp for metrics API (requires 'from' parameter)
     local metrics_from=$(date -u -v-1d "+%s" 2>/dev/null || date -u -d "1 day ago" "+%s" 2>/dev/null)
 
-    test_one "Credentials"              "/api/v1/validate"                            "if .valid then 1 else 0 end"
-    test_one "Organization"             "/api/v1/org"                                 ".org | if . then 1 else 0 end"
-    test_one "Dashboards"               "/api/v1/dashboard"                           ".dashboards | length"
-    test_one "Monitors"                 "/api/v1/monitor?page_size=1"                 "length"
-    test_one "Log Pipelines"            "/api/v1/logs/config/pipelines"               "length"
-    test_one "Log Indexes"              "/api/v1/logs/config/indexes"                 ".indexes | length"
-    test_one "Synthetic Tests"          "/api/v1/synthetics/tests?page_size=1"        ".tests | length"
-    test_one "SLOs"                     "/api/v1/slo?limit=1"                         ".data | length"
-    test_one "Downtimes"                "/api/v2/downtime?page%5Blimit%5D=1"          ".data | length"
-    test_one "Metrics"                  "/api/v1/metrics?from=${metrics_from}"        ".metrics | length"
-    test_one "Webhooks"                 "/api/v1/integration/webhooks"                ".webhooks | length"
-    test_one "Users"                    "/api/v2/users?page%5Bsize%5D=1"             ".data | length"
-    test_one "Roles"                    "/api/v2/roles?page%5Bsize%5D=1"             ".data | length"
-    test_one "Teams"                    "/api/v2/teams?page%5Bsize%5D=1"             ".data | length"
-    test_one "Audit Trail (analytics)"  "/api/v2/audit/events?page%5Blimit%5D=1"     ".data | length"
-    test_one "Usage Metering (analytics)" "/api/v1/usage/logs_by_index?start_hr=2024-01-01T00&end_hr=2024-01-02T00" ".usage | length"
+    test_one "Credentials"              "/api/v1/validate"                            "@valid"
+    test_one "Organization"             "/api/v1/org"                                 "@org"
+    test_one "Dashboards"               "/api/v1/dashboard"                           "@key:dashboards"
+    test_one "Monitors"                 "/api/v1/monitor?page_size=1"                 "@root"
+    test_one "Log Pipelines"            "/api/v1/logs/config/pipelines"               "@root"
+    test_one "Log Indexes"              "/api/v1/logs/config/indexes"                 "@key:indexes"
+    test_one "Synthetic Tests"          "/api/v1/synthetics/tests?page_size=1"        "@key:tests"
+    test_one "SLOs"                     "/api/v1/slo?limit=1"                         "@key:data"
+    test_one "Downtimes"                "/api/v2/downtime?page%5Blimit%5D=1"          "@key:data"
+    test_one "Metrics"                  "/api/v1/metrics?from=${metrics_from}"        "@key:metrics"
+    test_one "Webhooks"                 "/api/v1/integration/webhooks"                "@key:webhooks"
+    test_one "Users"                    "/api/v2/users?page%5Bsize%5D=1"             "@key:data"
+    test_one "Roles"                    "/api/v2/roles?page%5Bsize%5D=1"             "@key:data"
+    test_one "Teams"                    "/api/v2/teams?page%5Bsize%5D=1"             "@key:data"
+    test_one "Audit Trail (analytics)"  "/api/v2/audit/events?page%5Blimit%5D=1"     "@key:data"
+    test_one "Usage Metering (analytics)" "/api/v1/usage/logs_by_index?start_hr=2024-01-01T00&end_hr=2024-01-02T00" "@key:usage"
 
     echo "$sep"
     printf "  | %-32s   ${GREEN}PASS: %-3s${NC}   ${YELLOW}WARN: %-3s${NC}   ${RED}FAIL: %-3s${NC} |\n" \
