@@ -49,7 +49,7 @@
 <header>
   <div class="kicker">Operator Runbook &middot; Dual-Platform</div>
   <h1>DMA DataDog Export — Operator Plan</h1>
-  <div class="meta">Covers both <b>macOS/Linux</b> <code>dma-datadog-export.sh</code> and <b>Windows</b> <code>dma-datadog-export.ps1</code> &middot; v2.0.1 &middot; Prepared 2026-06-03</div>
+  <div class="meta">Covers both <b>macOS/Linux</b> <code>dma-datadog-export.sh</code> and <b>Windows</b> <code>dma-datadog-export.ps1</code> &middot; v2.0.2 &middot; Prepared 2026-06-03</div>
 </header>
 
 <div class="lede">
@@ -91,9 +91,9 @@
 <h2><span class="phase">0</span>Workstation &amp; inputs</h2>
 
 <h3>Tooling — differs by platform</h3>
-<div class="plat"><span class="os os-mac">macOS / Linux</span> — needs <code>curl</code>, <code>jq</code>, <code>tar</code> (script aborts on startup if any is missing). macOS ships curl + tar but <b>not jq</b>.</div>
+<div class="plat"><span class="os os-mac">macOS / Linux</span> — needs <code>curl</code>, <code>awk</code>, <code>tar</code> (script aborts on startup if any is missing). All three ship with macOS and are standard on Linux — <b>nothing to install</b> (as of v2.0.2 the script is jq-free; JSON is parsed in pure bash/awk).</div>
 <pre>curl --version
-jq   --version      # if missing:  brew install jq    (Linux: apt-get install jq)
+awk  --version      # any POSIX awk (BSD awk on macOS, gawk/mawk on Linux)
 tar  --version
 bash --version      # 3.2+ is fine (macOS default)</pre>
 <div class="plat"><span class="os os-win">Windows</span> — <b>zero external dependencies</b>: PowerShell 5.1+ (pre-installed) and <code>tar.exe</code> (built into Windows 10 build 1803+ / Windows 11). No curl or jq needed.</div>
@@ -246,8 +246,8 @@ powershell -ExecutionPolicy Bypass -File .\dma-datadog-export.ps1 -TestAccess</p
 <li><b>Inspect the manifest</b> — the authoritative record. Confirm <code>organization_name</code>/<code>id</code> is the <i>right org</i> (correct keys/region), <code>exported_items</code> counts are non-zero where you expect data, and <code>failed_api_calls</code> is low.
 <div class="plat"><span class="os os-mac">macOS / Linux</span></div>
 <pre>cd &lt;output&gt;/datadog-export-&lt;TIMESTAMP&gt;
-jq '.datadog_info, .export_statistics, .exported_items' manifest.json
-ls dashboards | head        # expect dashboard-&lt;id&gt;.json files, not just _list.json</pre>
+python3 -m json.tool manifest.json   # or: cat manifest.json   (jq optional, not required)
+ls dashboards | head                 # expect dashboard-&lt;id&gt;.json files, not just _list.json</pre>
 <div class="plat"><span class="os os-win">Windows</span></div>
 <pre>cd &lt;output&gt;\datadog-export-&lt;TIMESTAMP&gt;
 $m = Get-Content manifest.json -Raw | ConvertFrom-Json
@@ -299,7 +299,7 @@ if ($actual -eq $expected) { "OK" } else { "MISMATCH" }</pre>
 <tr><td>Credentials PASS but every export fails</td><td>App Key is wrong (validate only checks the API Key) &rarr; verify App Key separately</td></tr>
 <tr><td><code>Authentication failed (403)</code> during export</td><td>Wrong API or App Key &rarr; re-verify/regenerate both</td></tr>
 <tr><td>"Could not resolve host" / no response in access test</td><td>Wrong site, no internet, firewall/proxy, or guessed dedicated-cluster URL &rarr; confirm region; try site <code>app</code> or full domain/URL; set proxy</td></tr>
-<tr><td><span class="os os-mac">mac/Linux</span> <code>jq: command not found</code></td><td><code>brew install jq</code> (macOS) / <code>apt-get install jq</code> (Linux)</td></tr>
+<tr><td><span class="os os-mac">mac/Linux</span> <code>awk: command not found</code></td><td>Rare (awk is POSIX) &rarr; <code>apt-get install gawk</code> / <code>apk add gawk</code>; macOS ships awk. <span class="mut">(jq is no longer required as of v2.0.2.)</span></td></tr>
 <tr><td><span class="os os-mac">mac/Linux</span> <code>$'\r': command not found</code></td><td>CRLF line endings &rarr; run once; it self-converts and re-executes</td></tr>
 <tr><td><span class="os os-mac">mac/Linux</span> <code>Unknown option: --non-interactive</code></td><td>That flag isn't implemented in bash &rarr; just supply <code>--api-key</code>, <code>--app-key</code>, and <code>--site</code></td></tr>
 <tr><td><span class="os os-win">Windows</span> script won't run / "running scripts is disabled"</td><td>Execution policy &rarr; <code>Unblock-File</code> then <code>powershell -ExecutionPolicy Bypass -File .\dma-datadog-export.ps1 …</code></td></tr>
@@ -322,7 +322,7 @@ if ($actual -eq $expected) { "OK" } else { "MISMATCH" }</pre>
 </ul>
 
 <footer>
-Operator runbook for <code>dma-datadog-export.sh</code> (macOS/Linux) and <code>dma-datadog-export.ps1</code> (Windows), v2.0.1. Grounded in both script sources as of 2026-06-03, cross-checked against README.md and USAGE.md. Re-validate against the scripts if the version changes.
+Operator runbook for <code>dma-datadog-export.sh</code> (macOS/Linux) and <code>dma-datadog-export.ps1</code> (Windows), v2.0.2. Grounded in both script sources as of 2026-06-03, cross-checked against README.md and USAGE.md. Re-validate against the scripts if the version changes.
 </footer>
 </div>
 </body>

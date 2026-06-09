@@ -1,6 +1,6 @@
 # DMA DataDog Export Script
 
-**Version**: 2.0.1
+**Version**: 2.0.2
 **Last Updated**: June 2026
 
 > **Developed for Dynatrace One by Enterprise Solutions & Architecture**
@@ -14,12 +14,75 @@ Two export scripts are provided — choose the one that matches your environment
 
 | Script | Platform | Requirements |
 |--------|----------|--------------|
-| `dma-datadog-export.sh` | Linux, macOS, WSL | bash, curl, jq, tar |
-| `dma-datadog-export.ps1` | Windows (PowerShell 5.1+) | tar.exe (Windows 10 build 1803+) |
+| `dma-datadog-export.sh` | Linux, macOS, WSL | bash, curl, awk, tar — **all pre-installed on macOS and standard on Linux. No `jq`, no Python, nothing to install.** |
+| `dma-datadog-export.ps1` | Windows (PowerShell 5.1+) | tar.exe (Windows 10 build 1803+) — no external dependencies |
 
-Both scripts produce the same output archive structure and are feature-equivalent for the core export. A few **usage-analytics** details differ by platform — see the platform-divergence note in [Opt-In: Usage Analytics](#opt-in-usage-analytics-default-off) below. The bash script is preferred on Linux/macOS; the PowerShell script is preferred on Windows.
+Both scripts are **zero-install**: they rely only on tools that ship with the OS. Both produce the same output archive structure and are feature-equivalent for the core export. A few **usage-analytics** details differ by platform — see the platform-divergence note in [Opt-In: Usage Analytics](#opt-in-usage-analytics-default-off) below. The bash script is preferred on Linux/macOS; the PowerShell script is preferred on Windows.
+
+> **No `jq` required (as of v2.0.2).** The bash script parses and builds all JSON in pure bash + POSIX `awk` — it no longer depends on `jq`. If you used an earlier version that required `brew install jq`, that step is gone.
 
 > **DataDog SaaS only.** DataDog does not offer self-hosted versions, so there is no on-premises variant of this script.
+
+---
+
+## Step-by-Step Operator Guide (start here)
+
+This is the complete path from a clean machine to an uploaded archive. Each step links to its detailed section. **Do them in order** — the most common cause of a bad export is skipping Step 4.
+
+> **The one rule that prevents 90% of problems:** a missing *read* scope makes DataDog return `200 OK` with **empty data**, not an error. So an export can finish "successfully" yet be missing dashboards/monitors/etc. **Step 4 (`--test-access`) is how you catch this before it happens.** Don't skip it.
+
+### Step 1 — Get the script onto a machine with internet access
+
+Any laptop, jump host, or CI runner that can reach the DataDog API works ([details](#where-to-run)). On macOS/Linux:
+
+```bash
+chmod +x dma-datadog-export.sh
+```
+
+Confirm the (pre-installed) tooling is present — `curl --version`, `awk --version`, `tar --version`. Nothing to install ([prerequisites](#prerequisites)).
+
+### Step 2 — Create two DataDog credentials *with the right scopes*
+
+In **Organization Settings**, create an **API Key** and an **Application Key** ([details](#what-you-need)). The Application Key carries the permissions — grant it **all Tier-1 scopes** ([scope tiers](#application-key-scopes--required-vs-optional)). Add Tier-2 scopes only if you plan to use `--usage`.
+
+### Step 3 — Find your DataDog region
+
+Read it from the URL in your DataDog browser tab and map it to a `--site` value ([regions](#datadog-regions)). US1 is the default (`app`).
+
+### Step 4 — Verify access (`--test-access`) — **the critical gate**
+
+```bash
+./dma-datadog-export.sh --api-key "<API>" --app-key "<APP>" --site <SITE> --test-access
+```
+
+This writes **nothing** — it probes every category and prints a PASS/WARN/FAIL table ([how to read it](#verify-access-and-permissions)). **Do not proceed until there are zero `FAIL` rows** and every category you expect to contain data shows a non-zero count. `WARN` is fine if it's only on `--usage` scopes you don't need.
+
+### Step 5 — Decide scope
+
+- **Just config?** Run the defaults.
+- **Want usage/cost intelligence** (views, triggers, log volume, unused assets)? Add `--usage` ([what it does](#how-usage-analytics-estimates-asset-usage)) — and make sure Tier-2 scopes passed in Step 4.
+- **Huge org / only need some categories?** Use `--skip-*` flags ([reference](#scope--skip-flags)).
+
+### Step 6 — Run the export
+
+```bash
+./dma-datadog-export.sh --api-key "<API>" --app-key "<APP>" --site <SITE> --output ./datadog-export
+```
+
+What you'll see and how long it takes: [Running the Export](#running-the-export) and [Typical Runtimes](#typical-runtimes).
+
+### Step 7 — Verify the export is *complete* (not just "finished")
+
+"It finished" ≠ "it's complete." Check:
+1. **No `⚠ POTENTIAL SILENT FAILURES DETECTED` box** was printed at the end.
+2. **`manifest.json`** shows the right org and non-zero counts where you expect data.
+3. The detail folders contain per-item files (e.g. `dashboards/dashboard-*.json`), not just `_list.json`.
+
+If anything looks empty, fix the scope (Step 2), re-test (Step 4), re-run.
+
+### Step 8 — Hand off the archive
+
+Verify the checksum and upload the `.tar.gz` ([where to upload](#where-to-upload-the-archive)).
 
 ---
 
@@ -33,11 +96,13 @@ Both scripts produce the same output archive structure and are feature-equivalen
 |-------------|--------|
 | **Platform** | Linux, macOS, or WSL |
 | **Shell** | bash 3.2+ (works with macOS default bash) |
-| **curl** | `curl --version` to verify |
-| **jq** | `jq --version` to verify — install with `brew install jq` (macOS) or `apt-get install jq` (Linux) |
+| **curl** | `curl --version` to verify (pre-installed on macOS; standard on Linux) |
+| **awk** | `awk --version` (or just `awk` — any POSIX awk: BSD awk on macOS, gawk/mawk on Linux). Used for all JSON processing |
 | **tar** | `tar --version` to verify |
 | **Network** | HTTPS access to your DataDog API endpoint (see regions below) |
 | **Disk space** | 500 MB+ free in the working directory |
+
+> `jq` is **not** required. All JSON is handled in pure bash + awk, so the script runs on a clean macOS/Linux box with nothing to install.
 
 **PowerShell script (`dma-datadog-export.ps1`)**
 
@@ -72,15 +137,19 @@ You need two credentials from DataDog:
 | **API Key** | Organization Settings → API Keys → New Key | `DD-API-KEY` |
 | **Application Key** | Organization Settings → Application Keys → New Key | `DD-APPLICATION-KEY` |
 
-### Required Application Key Scopes
+### Application Key Scopes — Required vs Optional
 
-When creating the Application Key, grant **all** of the following scopes:
+Scopes fall into **three tiers**. Tier 1 is **mandatory**; Tiers 2 and 3 are **optional** and degrade gracefully — a missing optional scope skips just that data, it never aborts the export. When in doubt, run [`--test-access`](#verify-access-and-permissions) — it reports exactly which scopes you have.
 
-| Scope | What It Unlocks |
-|-------|----------------|
+#### Tier 1 — Required (core export — grant ALL of these)
+
+A missing Tier-1 scope is the **most dangerous** failure mode: DataDog returns `200 OK` with an **empty list** (not a `403`) when a read scope is absent, so the export *looks* successful but silently omits that category. Always confirm these with `--test-access`.
+
+| Scope | Unlocks |
+|-------|---------|
 | `dashboards_read` | Dashboard configurations |
 | `monitors_read` | Monitor and alert configurations |
-| `org_management` | Organization settings and metadata |
+| `org_management` | Organization name/metadata (manifest) |
 | `logs_read_config` | Log pipeline and log index configurations |
 | `synthetics_read` | Synthetic test configurations |
 | `slos_read` | SLO configurations |
@@ -90,14 +159,29 @@ When creating the Application Key, grant **all** of the following scopes:
 | `user_access_read` | Users and roles |
 | `teams_read` | Teams |
 
-**For usage analytics** (`--usage` flag), two additional scopes are required:
+#### Tier 2 — Optional: Usage Analytics (only needed with `--usage`)
 
-| Scope | What It Unlocks |
-|-------|----------------|
-| `audit_trail_read` | Dashboard views, monitor triggers, and modification history via the Audit Trail API |
-| `usage_read` | Log index ingestion volume via the Usage Metering API |
+| Scope | Unlocks |
+|-------|---------|
+| `audit_trail_read` | Dashboard views, monitor triggers, and monitor modification history (Audit Trail API) |
+| `usage_read` | Per-index log ingestion volume (Usage Metering API) |
 
-> If `audit_trail_read` or `usage_read` are missing, the `--usage` flag will run but produce empty analytics files. No error is raised. This is the most frequent reason the DMA Explorer shows zero usage data for DataDog assets.
+> If you run `--usage` without these, the run completes but the corresponding analytics files are **empty** — no error is raised. This is the #1 reason the DMA Explorer shows zero usage data. If you are not running `--usage`, you do not need these.
+
+#### Tier 3 — Optional: Additional Resources (best-effort, auto-skipped)
+
+The always-on [Additional Resources](#additional-resources-defaults-on-best-effort) pass sweeps ~25 extra config endpoints. Each is **best-effort**: if the key lacks that product's read scope (HTTP `401/403`) or the org doesn't use it (`404`), that single file is **skipped with a logged note** — never fatal, never counted in the manifest. You do **not** need to grant these for a successful migration export; grant them only if you want that extra config captured.
+
+| If you want… | Grant (representative) |
+|---|---|
+| APM retention filters / spans metrics | `apm_read` |
+| RUM applications | `rum_apps_read` (or RUM read) |
+| Security monitoring rules | `security_monitoring_rules_read` |
+| Incidents | `incident_read` |
+| Service catalog / reference tables / notebooks / powerpacks | covered by `dashboards_read` / catalog read |
+| Cloud integrations (AWS/Azure/GCP/PagerDuty), host tags | `integrations_read` |
+
+> Tier-3 scopes vary by DataDog plan and naming; rather than chase them, just run the export and check the log — anything skipped is clearly listed, and it's safe to ignore unless that resource matters to your migration.
 
 ### Verify Access and Permissions
 
@@ -235,6 +319,51 @@ The usage period defaults to 90 days. Override with `--usage-period 30d` or set 
 - Actual log or event data (only pipeline and index configuration)
 - SSL certificates or private keys
 - User passwords
+
+---
+
+## How Usage Analytics Estimates Asset Usage
+
+When you pass `--usage`, the script doesn't just copy configuration — it estimates **which assets are actually used** so you can prioritise (and prune) during migration. There is no single "usage" API in DataDog, so the script derives these estimates from **two** different DataDog APIs and then cross-references them with the exported inventory.
+
+### A. The Audit Trail API — "who did what, when"
+
+`GET /api/v2/audit/events` is DataDog's activity log. The script issues **filtered queries** over the lookback window (the `--usage-period`, default **90 days**), paginating with a cursor (up to 20 pages × 1000 events per query), then **groups the events by asset and counts them** (in pure bash/awk). Three signals come from here:
+
+| Analytics file | Audit query (`@evt.name:`) | Per-asset aggregation → meaning |
+|----------------|----------------------------|--------------------------------|
+| `dashboard_views.json` | `"Dashboard Viewed"` | grouped by dashboard → **view_count**, **unique_users** (distinct viewer emails), **last_viewed** → *is anyone actually looking at this dashboard?* |
+| `monitor_triggers.json` | `"Monitor Alert Triggered"` / `"Monitor Resolved"` | grouped by monitor → **trigger_count**, **resolve_count**, **total_events**, **last_triggered** → *does this monitor ever actually fire, or is it dormant?* |
+| `monitor_modifications.json` | `"Monitor Created"` / `"Monitor Modified"` | grouped by monitor → **modification_count**, **created/modified counts**, **last_modified**, **modified_by** → *is this monitor actively maintained, and by whom?* |
+
+So "usage" for dashboards and monitors is **estimated from audit activity**: a dashboard with many `Dashboard Viewed` events from several users is clearly in use; one with none is a pruning candidate.
+
+### B. The Usage Metering API — "how much volume / cost"
+
+`GET /api/v1/usage/logs_by_index` is DataDog's billing/metering data. The API caps each request to ~one month, so the script **paginates by month** across the window and **sums per index**:
+
+| Analytics file | Source | Per-index aggregation → meaning |
+|----------------|--------|--------------------------------|
+| `log_index_volume.json` | Usage Metering (`logs_by_index`) | **total_event_count**, **total_retention_event_count**, **days_active**, sorted by volume → *which log indexes carry real ingest volume (cost) vs. near-empty ones you can consolidate?* |
+
+### C. Cross-reference → unused assets
+
+The script then combines the **full exported inventory** (every dashboard/monitor it pulled) with the **activity signals** above:
+
+| Analytics file | How it's derived |
+|----------------|------------------|
+| `unused_dashboards.json` | dashboards present in the export **minus** those with any `Dashboard Viewed` event in the window → dashboards never viewed |
+| `unused_monitors.json` | monitors present in the export **minus** those with any trigger event → monitors that never fired |
+| `_summary.json` | roll-up counts for all of the above (what the DMA Explorer reads first) |
+
+### What "estimate" means — important caveats
+
+- **Window-bounded.** Everything is "within the last `--usage-period`" (default 90d), **not all-time**. A monitor that last fired 100 days ago shows as *unused* for a 90-day window. Widen with `--usage-period 180d` if needed.
+- **Audit Trail retention.** Events older than your DataDog plan's Audit Trail retention simply aren't there to count — the estimate is only as deep as your retention.
+- **Dashboard views are plan-dependent.** DataDog only records `Dashboard Viewed` audit events on some plans. If yours doesn't, `dashboard_views.json` is empty and `unused_dashboards.json` reports `view_data_available: false` (it won't guess). The PowerShell script doesn't attempt dashboard views at all and always writes `not_available` — collect the **Dashboards → Popular Dashboards** list from the UI instead (see [USAGE.md](USAGE.md)).
+- **Log volume is metering, not a bill.** `total_event_count` is ingested-event volume per index — a relative cost/activity signal, not a billing-exact figure.
+
+Net: treat these as **decision-support estimates** for "keep / consolidate / drop," not as audited ground truth.
 
 ---
 
@@ -437,7 +566,7 @@ The final archive is written to `{output}/{name}.tar.gz` alongside a SHA-256 che
 
 When run without CLI arguments, the script:
 
-1. Checks that `curl`, `jq`, and `tar` are installed
+1. Checks that `curl`, `awk`, and `tar` are installed
 2. Prompts for API Key, Application Key, and site/region
 3. Validates credentials against `/api/v1/validate` and fetches the organization name
 4. Exports each data category in sequence, showing a progress bar per category
@@ -476,7 +605,7 @@ The DataDog API enforces per-endpoint rate limits. The script handles this autom
 | **PowerShell:** `No response` for a known dedicated cluster | TLS certificate not trusted by Windows certificate store | Add `-SkipCertCheck` to the PowerShell command — use only on trusted networks |
 | **PowerShell:** `API call failed (0)` for all endpoints | File write error masked as API failure (pre-2.0.1) | Upgrade to the current version; the actual error is now shown |
 | **PowerShell:** Output goes to wrong location | Relative `--output` path (e.g., `../folder`) resolved by .NET against `C:\Windows\` | Fixed in 2.0.1 — relative paths are now resolved against PowerShell's working directory |
-| `jq: command not found` | `jq` not installed | `brew install jq` (macOS) or `apt-get install jq` (Linux) |
+| `awk: command not found` | No awk on PATH (extremely rare — awk is part of POSIX) | Install via your package manager (`apt-get install gawk` / `apk add gawk`). macOS ships awk by default |
 | `$'\r': command not found` | Windows CRLF line endings | Run the script once — it auto-converts itself and re-executes |
 | Archive not created at end | `tar` failed — usually disk space | Ensure 500 MB+ free; use `--output` to point to a partition with more space |
 | `Rate limited (429)` logged repeatedly | Very large environment hitting API burst limits | Script retries automatically; if it keeps failing, reduce concurrency by running with `--skip-metrics --skip-users` first and re-running those categories separately |
@@ -490,7 +619,7 @@ Add `--debug` to enable detailed diagnostic output:
 
 - Every API call is logged with endpoint, HTTP status code, and body
 - Rate limit retries and backoff timing are shown
-- All `jq` processing steps emit intermediate counts
+- Concurrency throttles (`max-parallel=N`) and pagination/aggregation steps emit intermediate counts
 
 Debug output goes to both the console and `export.log` inside the archive.
 
@@ -508,6 +637,14 @@ The `manifest.json` embedded in the archive tells the DMA Server which script ve
 ---
 
 ## Release Notes
+
+### v2.0.2 — Zero-dependency bash (jq removed)
+
+- **`jq` is no longer required** by `dma-datadog-export.sh`. All JSON parsing, counting, pagination, aggregation, and emission is now done in pure **bash + POSIX awk** via an embedded JSON layer. The bash script now runs on a clean macOS/Linux box with **nothing to install** (curl, awk, and tar all ship with the OS), matching the PowerShell script's zero-install property.
+- **Verified equivalent to the previous jq implementation** by differential testing on identical inputs — byte/semantically identical output across the full export (core + usage analytics) under both **BSD awk (macOS)** and **gawk (Linux)**, plus a real multi-thousand-asset production org.
+- **Byte-deterministic processing** — the script forces `LC_ALL=C` so the awk layer is byte-oriented and identical across awk implementations (gawk's UTF-8 locale otherwise diverges on multibyte data).
+- **Manifest hardening** — the organization name and other free-text fields are now JSON-escaped in `manifest.json` (quotes/backslashes/unicode can no longer produce invalid JSON).
+- **Concurrency** — detail-heavy categories (dashboards, log pipelines, synthetics) are fetched concurrently with per-endpoint caps (`DASHBOARD_CONCURRENCY`/`SYNTHETICS_CONCURRENCY`/`LOGS_CONCURRENCY`) and 429 back-off, plus a best-effort **Additional Resources** pass (~25 extra config endpoints). PowerShell is unchanged this release.
 
 ### v2.0.1 — PowerShell improvements and site flexibility
 

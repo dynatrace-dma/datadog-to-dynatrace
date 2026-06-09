@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    DMA DataDog Export Script v2.0.1 (PowerShell)
+    DMA DataDog Export Script v2.0.2 (PowerShell)
 
 .DESCRIPTION
     REST API-Only Data Collection for DataDog to Dynatrace Migration.
@@ -123,7 +123,7 @@ param(
 # SCRIPT CONFIGURATION
 # =============================================================================
 
-$script:ScriptVersion     = "2.0.1"
+$script:ScriptVersion     = "2.0.2"
 $script:ScriptName        = "DMA DataDog Export"
 
 $script:DatadogApiKey     = $ApiKey

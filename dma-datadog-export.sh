@@ -9,7 +9,7 @@ fi
 
 ################################################################################
 #
-#  DMA DataDog Export Script v2.0.1
+#  DMA DataDog Export Script v2.0.2
 #
 #  REST API-Only Data Collection for DataDog to Dynatrace Migration
 #
@@ -121,7 +121,7 @@ set -o pipefail  # Fail on pipe errors
 export LC_ALL=C
 export LANG=C
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 SCRIPT_NAME="DMA DataDog Export"
 
 # ANSI color codes
