@@ -113,6 +113,14 @@ set -o pipefail  # Fail on pipe errors
 # SCRIPT CONFIGURATION
 # =============================================================================
 
+# Force the C locale so all text processing is BYTE-oriented and deterministic.
+# Critical for the embedded awk JSON layer: gawk in a UTF-8 locale treats
+# substr/length as CHARACTER-based and printf "%c",N (N>127) as a codepoint
+# (double-encoding UTF-8), whereas BSD awk is byte-based. C locale makes both
+# behave identically (byte-for-byte), matching jq's output for unicode.
+export LC_ALL=C
+export LANG=C
+
 SCRIPT_VERSION="2.0.1"
 SCRIPT_NAME="DMA DataDog Export"
 
@@ -310,15 +318,6 @@ check_requirements() {
         log ERROR "Install with: brew install ${missing_commands[*]} (macOS)"
         log ERROR "           or: apt-get install ${missing_commands[*]} (Linux)"
         return 1
-    fi
-
-    # Usage analytics (--usage) still depends on jq until that path is ported.
-    # If jq is absent, DISABLE analytics (rather than emit broken 0-byte files).
-    if [[ "$COLLECT_USAGE" == "true" ]] && ! command_exists jq; then
-        log WARNING "--usage analytics currently require 'jq', which is not installed."
-        log WARNING "Skipping usage analytics; the core export runs jq-free and is unaffected."
-        log WARNING "Install jq (brew install jq / apt-get install jq) to collect usage analytics."
-        COLLECT_USAGE=false
     fi
 
     return 0
@@ -610,6 +609,156 @@ uri_encode() {
     case "$c" in [a-zA-Z0-9._~-]) out+="$c" ;; *) out+=$(printf '%%%02X' "'$c") ;; esac
   done
   printf '%s' "$out"
+}
+
+
+# --- Usage-analytics aggregators (group_by/flatten) for --usage, no jq ---
+# _json_audit_aggregate <events-json-array> <mode>   mode: triggers|mods|views
+_json_audit_aggregate() {
+  printf '%s' "$1" | awk -v mode="$2" '
+  BEGIN{ for(z=1;z<256;z++) ORDT[sprintf("%c",z)]=z; US=sprintf("%c",1) }
+  { data = data $0 "\n" }
+  END {
+    L=length(data); i=1
+    while(i<=L){c=substr(data,i,1); if(c==" "||c=="\t"||c=="\n"||c=="\r")i++; else break}
+    if(substr(data,i,1)!="[") { print "[]"; exit }
+    i++; depth=1; instr=0; esc=0; el=""
+    while(i<=L){ c=substr(data,i,1)
+      if(instr){ el=el c; if(esc)esc=0; else if(c=="\\")esc=1; else if(c=="\"")instr=0; i++; continue }
+      if(c=="\""){instr=1; el=el c; i++; continue}
+      if(c==" "||c=="\t"||c=="\n"||c=="\r"){i++; continue}
+      if(c=="{"||c=="["){depth++; el=el c; i++; continue}
+      if(c=="}"||c=="]"){ depth--; if(depth==0){ ev(el); el=""; break } el=el c; i++; continue }
+      if(c==","&&depth==1){ ev(el); el=""; i++; continue }
+      el=el c; i++ }
+    emit()
+  }
+  function ev(e,   id,attr,asset,evt,usr,en,ts,em,k){
+    if(e=="") return
+    attr=objget(e,"attributes"); asset=objget(attr,"asset"); evt=objget(attr,"evt"); usr=objget(attr,"usr")
+    id=unesc(objget(asset,"id"))
+    if(!(id in seen)){ seen[id]=1; order[++ng]=id }
+    idr[id]=objget(asset,"id")          # RAW id token (preserve jq type)
+    name[id]=unesc(objget(asset,"name"))
+    ts=unesc(objget(attr,"timestamp")); if(ts>lastts[id]) lastts[id]=ts
+    en=unesc(objget(evt,"name"))
+    cnt[id]++
+    if(en=="Monitor Alert Triggered") trig[id]++
+    if(en=="Monitor Resolved")        res[id]++
+    if(en=="Monitor Created")         cre[id]++
+    if(en=="Monitor Modified")        mod[id]++
+    em=unesc(objget(usr,"email"))
+    if(em!=""){ k=id US em; if(!(k in usn)){ usn[k]=1; ul[id]=ul[id] (ul[id]==""?"":US) em } }
+  }
+  function emit(   a,j,key,best,t,m){
+    for(j=1;j<=ng;j++){ key=order[j]; sm[key]=(mode=="triggers")?(trig[key]+0):(cnt[key]+0) }
+    for(a=1;a<=ng;a++){ best=a
+      for(j=a+1;j<=ng;j++) if(sm[order[j]]>sm[order[best]] || (sm[order[j]]==sm[order[best]] && order[j]<order[best])) best=j
+      t=order[a]; order[a]=order[best]; order[best]=t }
+    printf "["
+    for(a=1;a<=ng;a++){ key=order[a]; if(a>1)printf ","
+      if(mode=="triggers")
+        printf "{\"monitor_id\":%s,\"monitor_name\":%s,\"trigger_count\":%d,\"resolve_count\":%d,\"total_events\":%d,\"last_triggered\":%s}", idr[key], js(name[key]), trig[key]+0, res[key]+0, cnt[key], js(lastts[key])
+      else if(mode=="mods")
+        printf "{\"monitor_id\":%s,\"monitor_name\":%s,\"modification_count\":%d,\"created_events\":%d,\"modified_events\":%d,\"last_modified\":%s,\"modified_by\":%s}", idr[key], js(name[key]), cnt[key], cre[key]+0, mod[key]+0, js(lastts[key]), uarr(key)
+      else
+        printf "{\"dashboard_id\":%s,\"dashboard_name\":%s,\"view_count\":%d,\"unique_users\":%d,\"last_viewed\":%s,\"users\":%s}", idr[key], js(name[key]), cnt[key], ucnt(key), js(lastts[key]), uarr(key)
+    }
+    printf "]\n"
+  }
+  function ucnt(key,   p){ if(ul[key]=="")return 0; return split(ul[key],p,US) }
+  function uarr(key,   np,p,a,i,b,t,s){ if(ul[key]=="")return "[]"
+    np=split(ul[key],p,US)
+    for(a=1;a<=np;a++){ b=a; for(i=a+1;i<=np;i++) if(p[i]<p[b])b=i; t=p[a];p[a]=p[b];p[b]=t }
+    s="["; for(a=1;a<=np;a++){ if(a>1)s=s","; s=s js(p[a]) } return s "]" }
+  function js(s,   o,i,c,d){ o="\""; for(i=1;i<=length(s);i++){ c=substr(s,i,1)
+      if(c=="\\")o=o "\\\\"; else if(c=="\"")o=o "\\\""; else if(c=="\t")o=o "\\t"; else if(c=="\n")o=o "\\n"; else if(c=="\r")o=o "\\r"
+      else { d=(c in ORDT)?ORDT[c]:32; if(d<32)o=o sprintf("\\u%04x",d); else o=o c } } return o "\"" }
+  function objget(e,k,   M,j,ch,instr,es,d,seg){ if(e=="")return ""; M=length(e); j=1
+    while(j<=M){ if(substr(e,j,1)=="{")break; j++ }
+    j++; d=1; instr=0; es=0; seg=""
+    while(j<=M){ ch=substr(e,j,1)
+      if(instr){ seg=seg ch; if(es)es=0; else if(ch=="\\")es=1; else if(ch=="\"")instr=0; j++; continue }
+      if(ch=="\""){instr=1; seg=seg ch; j++; continue}
+      if(ch=="{"||ch=="["){d++; seg=seg ch; j++; continue}
+      if(ch=="}"||ch=="]"){ d--; if(d==0){ if(segm(seg,k))return gv; seg=""; break } seg=seg ch; j++; continue }
+      if(ch==","&&d==1){ if(segm(seg,k))return gv; seg=""; j++; continue }
+      seg=seg ch; j++ } return "" }
+  function segm(seg,k,   M,j,ch,instr,es,col){ gv=""; if(seg=="")return 0; M=length(seg); instr=0; es=0; col=0
+    for(j=1;j<=M;j++){ ch=substr(seg,j,1)
+      if(instr){ if(es)es=0; else if(ch=="\\")es=1; else if(ch=="\"")instr=0; continue }
+      if(ch=="\""){instr=1; continue} if(ch==":"){col=j;break} }
+    if(col==0)return 0; if(unesc(substr(seg,1,col-1))!=k)return 0; gv=substr(seg,col+1); return 1 }
+  function unesc(v,   s,L,i,c,n,out,hex,code){ if(substr(v,1,1)!="\"")return v
+    s=substr(v,2,length(v)-2); L=length(s); i=1; out=""
+    while(i<=L){ c=substr(s,i,1)
+      if(c=="\\"&&i<L){ n=substr(s,i+1,1)
+        if(n=="n"){out=out "\n";i+=2;continue} if(n=="t"){out=out "\t";i+=2;continue}
+        if(n=="r"){out=out "\r";i+=2;continue} if(n=="/"){out=out "/";i+=2;continue}
+        if(n=="\\"){out=out "\\";i+=2;continue} if(n=="\""){out=out "\"";i+=2;continue}
+        if(n=="u"){ hex=substr(s,i+2,4); code=hxv(hex); out=out u8(code); i+=6; continue }
+        out=out n; i+=2; continue }
+      out=out c; i++ } return out }
+  function hxv(h,   k,d,val,ch){ val=0; for(k=1;k<=length(h);k++){ ch=tolower(substr(h,k,1)); d=index("0123456789abcdef",ch)-1; if(d<0)return 0; val=val*16+d } return val }
+  function u8(cp){ if(cp<128)return sprintf("%c",cp); if(cp<2048)return sprintf("%c",192+int(cp/64)) sprintf("%c",128+(cp%64)); return sprintf("%c",224+int(cp/4096)) sprintf("%c",128+(int(cp/64)%64)) sprintf("%c",128+(cp%64)) }
+  '
+}
+
+# _json_usage_flatten <usage-response-json>  -> indexes array json (group by index_name)
+_json_usage_flatten() {
+  printf '%s' "$1" | awk '
+  BEGIN{ for(z=1;z<256;z++) ORDT[sprintf("%c",z)]=z }
+  { data=data $0 "\n" }
+  END{
+    usage=topval(data,"usage"); if(usage=="") { print "[]"; exit }
+    nu=split_elems(usage, U)
+    for(u=1;u<=nu;u++){ bi=objget(U[u],"by_index"); if(bi=="")continue
+      nb=split_elems(bi, B)
+      for(b=1;b<=nb;b++){ inm=unesc(objget(B[b],"index_name"))
+        ec=objget(B[b],"event_count"); rc=objget(B[b],"retention_event_count")
+        ec=(ec=="")?0:ec+0; rc=(rc=="")?0:rc+0
+        if(!(inm in seen)){seen[inm]=1; order[++ng]=inm; rawname[inm]=objget(B[b],"index_name")}
+        evt[inm]+=ec; ret[inm]+=rc; days[inm]++ } }
+    # sort desc by evt
+    for(a=1;a<=ng;a++){ best=a; for(j=a+1;j<=ng;j++) if(evt[order[j]]>evt[order[best]] || (evt[order[j]]==evt[order[best]] && order[j]<order[best])) best=j; t=order[a];order[a]=order[best];order[best]=t }
+    printf "["
+    for(a=1;a<=ng;a++){ k=order[a]; if(a>1)printf ","
+      printf "{\"index_name\":%s,\"total_event_count\":%d,\"total_retention_event_count\":%d,\"days_active\":%d}", rawname[k], evt[k], ret[k], days[k] }
+    printf "]\n"
+  }
+  function topval(d,key,   o){ o=objget(d,key); return o }
+  function split_elems(arr, OUT,   L,i,c,depth,instr,esc,el,n){ L=length(arr); i=1; n=0
+    while(i<=L){c=substr(arr,i,1); if(c==" "||c=="\t"||c=="\n"||c=="\r")i++; else break}
+    if(substr(arr,i,1)!="[")return 0
+    i++; depth=1; instr=0; esc=0; el=""
+    while(i<=L){ c=substr(arr,i,1)
+      if(instr){el=el c; if(esc)esc=0; else if(c=="\\")esc=1; else if(c=="\"")instr=0; i++; continue}
+      if(c=="\""){instr=1;el=el c;i++;continue}
+      if(c==" "||c=="\t"||c=="\n"||c=="\r"){i++;continue}
+      if(c=="{"||c=="["){depth++;el=el c;i++;continue}
+      if(c=="}"||c=="]"){depth--; if(depth==0){ if(el!="")OUT[++n]=el; el=""; break } el=el c;i++;continue}
+      if(c==","&&depth==1){ if(el!="")OUT[++n]=el; el=""; i++; continue }
+      el=el c; i++ }
+    return n }
+  function objget(e,k,   M,j,ch,instr,es,d,seg){ if(e=="")return ""; M=length(e); j=1
+    while(j<=M){ if(substr(e,j,1)=="{")break; j++ } j++; d=1; instr=0; es=0; seg=""
+    while(j<=M){ ch=substr(e,j,1)
+      if(instr){ seg=seg ch; if(es)es=0; else if(ch=="\\")es=1; else if(ch=="\"")instr=0; j++; continue }
+      if(ch=="\""){instr=1; seg=seg ch; j++; continue}
+      if(ch=="{"||ch=="["){d++; seg=seg ch; j++; continue}
+      if(ch=="}"||ch=="]"){ d--; if(d==0){ if(segm(seg,k))return gv; seg=""; break } seg=seg ch; j++; continue }
+      if(ch==","&&d==1){ if(segm(seg,k))return gv; seg=""; j++; continue }
+      seg=seg ch; j++ } return "" }
+  function segm(seg,k,   M,j,ch,instr,es,col){ gv=""; if(seg=="")return 0; M=length(seg); instr=0;es=0;col=0
+    for(j=1;j<=M;j++){ ch=substr(seg,j,1)
+      if(instr){ if(es)es=0; else if(ch=="\\")es=1; else if(ch=="\"")instr=0; continue }
+      if(ch=="\""){instr=1; continue} if(ch==":"){col=j;break} }
+    if(col==0)return 0; if(unesc(substr(seg,1,col-1))!=k)return 0; gv=substr(seg,col+1); return 1 }
+  function unesc(v,   s,L,i,c,n,out){ if(substr(v,1,1)!="\"")return v; s=substr(v,2,length(v)-2); L=length(s); i=1; out=""
+    while(i<=L){ c=substr(s,i,1)
+      if(c=="\\"&&i<L){ n=substr(s,i+1,1); if(n=="\\"){out=out "\\";i+=2;continue} if(n=="\""){out=out "\"";i+=2;continue} if(n=="/"){out=out "/";i+=2;continue} out=out n;i+=2;continue }
+      out=out c; i++ } return out }
+  '
 }
 
 # ---------------------------------------------------------------------------
@@ -1512,36 +1661,39 @@ audit_trail_query() {
     local from_ts=$(get_usage_from_timestamp)
     local to_ts=$(get_usage_to_timestamp)
     local page_limit=1000
-    local all_events="[]"
     local cursor=""
     local page=0
     local max_pages=20
+    local elems_file=$(mktemp); : > "$elems_file"
+    local enc_q=$(uri_encode "$filter_query")
 
     log DEBUG "Audit Trail query: $filter_query (from=$from_ts, to=$to_ts)"
 
     while [ $page -lt $max_pages ]; do
-        local endpoint="/api/v2/audit/events?filter%5Bquery%5D=$(jq -rn --arg q "$filter_query" '$q | @uri')&filter%5Bfrom%5D=${from_ts}&filter%5Bto%5D=${to_ts}&page%5Blimit%5D=${page_limit}"
+        local endpoint="/api/v2/audit/events?filter%5Bquery%5D=${enc_q}&filter%5Bfrom%5D=${from_ts}&filter%5Bto%5D=${to_ts}&page%5Blimit%5D=${page_limit}"
         if [[ -n "$cursor" ]]; then
             endpoint="${endpoint}&page%5Bcursor%5D=${cursor}"
         fi
 
         local temp_file=$(mktemp)
         if dd_api_call "GET" "$endpoint" "$temp_file"; then
-            local page_events=$(jq -r '.data // [] | length' "$temp_file" 2>/dev/null)
-            if [[ "$page_events" == "0" ]] || [[ -z "$page_events" ]]; then
+            local body=$(cat "$temp_file")
+            local data=$(json_get_raw "$body" data); [ -z "$data" ] && data="[]"
+            local page_events=$(json_len "$data")
+            if [[ "$page_events" == "0" ]]; then
                 rm -f "$temp_file"
                 break
             fi
 
-            # Merge page events into all_events
-            all_events=$(echo "$all_events" | jq --slurpfile page <(jq '.data // []' "$temp_file") '. + $page[0]')
+            # Accumulate page events (no jq merge)
+            json_split_array "$data" >> "$elems_file"
 
-            # Get next page cursor
-            cursor=$(jq -r '.meta.page.after // empty' "$temp_file" 2>/dev/null)
+            # Next page cursor: .meta.page.after  (// empty)
+            cursor=$(json_get "$(json_get_raw "$(json_get_raw "$body" meta)" page)" after)
             rm -f "$temp_file"
 
             page=$((page + 1))
-            log DEBUG "  Page $page: $page_events events (total so far: $(echo "$all_events" | jq 'length'))"
+            log DEBUG "  Page $page: $page_events events"
 
             if [[ -z "$cursor" ]] || [[ "$cursor" == "null" ]]; then
                 break
@@ -1553,8 +1705,9 @@ audit_trail_query() {
         fi
     done
 
-    echo "$all_events" > "$output_file"
-    local total=$(jq 'length' "$output_file" 2>/dev/null)
+    echo "[$(paste -sd, "$elems_file" 2>/dev/null)]" > "$output_file"
+    rm -f "$elems_file"
+    local total=$(json_len "$(cat "$output_file")")
     log DEBUG "Audit Trail collected $total events"
 }
 
@@ -1564,21 +1717,14 @@ collect_dashboard_views() {
     local raw_file=$(mktemp)
     local fails_before=$FAILED_API_CALLS
     audit_trail_query "@evt.name:\"Dashboard Viewed\"" "$raw_file"
-    if [[ $(jq 'length' "$raw_file" 2>/dev/null) == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
+    if [[ "$(json_len "$(cat "$raw_file")")" == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
         log WARNING "Dashboard views: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
     fi
 
-    # Aggregate: per-dashboard view count, unique users, last viewed
-    jq '[group_by(.attributes.asset.id) | .[] | {
-        dashboard_id: .[0].attributes.asset.id,
-        dashboard_name: .[0].attributes.asset.name,
-        view_count: length,
-        unique_users: ([.[].attributes.usr.email] | unique | length),
-        last_viewed: (sort_by(.attributes.timestamp) | last | .attributes.timestamp),
-        users: ([.[].attributes.usr.email] | unique)
-    }] | sort_by(-.view_count)' "$raw_file" > "$OUTPUT_DIR/analytics/dashboard_views.json" 2>/dev/null
+    # Aggregate: per-dashboard view count, unique users, last viewed (no jq)
+    _json_audit_aggregate "$(cat "$raw_file")" views > "$OUTPUT_DIR/analytics/dashboard_views.json"
 
-    local count=$(jq 'length' "$OUTPUT_DIR/analytics/dashboard_views.json" 2>/dev/null)
+    local count=$(json_len "$(cat "$OUTPUT_DIR/analytics/dashboard_views.json")")
     log SUCCESS "Dashboard views: $count dashboards with activity"
     rm -f "$raw_file"
 }
@@ -1589,20 +1735,13 @@ collect_monitor_triggers() {
     local raw_file=$(mktemp)
     local fails_before=$FAILED_API_CALLS
     audit_trail_query "@asset.type:monitor @evt.name:(\"Monitor Alert Triggered\" OR \"Monitor Resolved\")" "$raw_file"
-    if [[ $(jq 'length' "$raw_file" 2>/dev/null) == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
+    if [[ "$(json_len "$(cat "$raw_file")")" == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
         log WARNING "Monitor triggers: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
     fi
 
-    jq '[group_by(.attributes.asset.id) | .[] | {
-        monitor_id: .[0].attributes.asset.id,
-        monitor_name: .[0].attributes.asset.name,
-        trigger_count: [.[] | select(.attributes.evt.name == "Monitor Alert Triggered")] | length,
-        resolve_count: [.[] | select(.attributes.evt.name == "Monitor Resolved")] | length,
-        total_events: length,
-        last_triggered: (sort_by(.attributes.timestamp) | last | .attributes.timestamp)
-    }] | sort_by(-.trigger_count)' "$raw_file" > "$OUTPUT_DIR/analytics/monitor_triggers.json" 2>/dev/null
+    _json_audit_aggregate "$(cat "$raw_file")" triggers > "$OUTPUT_DIR/analytics/monitor_triggers.json"
 
-    local count=$(jq 'length' "$OUTPUT_DIR/analytics/monitor_triggers.json" 2>/dev/null)
+    local count=$(json_len "$(cat "$OUTPUT_DIR/analytics/monitor_triggers.json")")
     log SUCCESS "Monitor triggers: $count monitors with activity"
     rm -f "$raw_file"
 }
@@ -1616,8 +1755,7 @@ collect_log_index_volume() {
     to_date=$(get_usage_to_timestamp   | cut -c1-10)
     local outfile="$OUTPUT_DIR/analytics/log_index_volume.json"
 
-    local entries_file=$(mktemp)
-    echo '[]' > "$entries_file"
+    local usage_elems=$(mktemp); : > "$usage_elems"
     local any_data=false
 
     local current="$from_date"
@@ -1638,14 +1776,9 @@ collect_log_index_volume() {
             "/api/v1/usage/logs_by_index?start_hr=${current}T00&end_hr=${window_end}T23" \
             "$temp_file"; then
             any_data=true
-            # Flatten all per-day by_index entries from this window
-            local page_entries
-            page_entries=$(jq '[.usage // [] | .[] | (.by_index // []) | .[] |
-                {index_name, event_count: (.event_count // 0), retention_event_count: (.retention_event_count // 0)}]' \
-                "$temp_file" 2>/dev/null)
-            # Append to running list
-            jq -n --slurpfile a "$entries_file" --argjson b "$page_entries" '$a[0] + $b' \
-                > "${entries_file}.tmp" && mv "${entries_file}.tmp" "$entries_file"
+            # Accumulate this window's usage[] elements; flattened+grouped at the end
+            local uarr_w=$(json_get_raw "$(cat "$temp_file")" usage)
+            [ -n "$uarr_w" ] && json_split_array "$uarr_w" >> "$usage_elems"
         fi
         rm -f "$temp_file"
 
@@ -1659,26 +1792,18 @@ collect_log_index_volume() {
     done
 
     if [[ "$any_data" == "true" ]]; then
-        jq -n \
-            --arg from "$from_date" --arg to "$to_date" \
-            --slurpfile e "$entries_file" \
-            '{
-                period: {from: $from, to: $to},
-                indexes: [$e[0] | group_by(.index_name) | .[] | {
-                    index_name: .[0].index_name,
-                    total_event_count:            ([.[].event_count]            | add),
-                    total_retention_event_count:  ([.[].retention_event_count]  | add),
-                    days_active: length
-                }] | sort_by(-.total_event_count)
-            }' > "$outfile"
+        local combined_usage='{"usage":['"$(paste -sd, "$usage_elems" 2>/dev/null)"']}'
+        local indexes_json=$(_json_usage_flatten "$combined_usage")
+        printf '{"period":{"from":"%s","to":"%s"},"indexes":%s}\n' \
+            "$(json_escape "$from_date")" "$(json_escape "$to_date")" "$indexes_json" > "$outfile"
         local count
-        count=$(jq '.indexes | length' "$outfile" 2>/dev/null)
+        count=$(json_len "$indexes_json")
         log SUCCESS "Log index volume: $count indexes with usage data"
     else
         echo '{"indexes": [], "error": "Usage Metering API not available"}' > "$outfile"
         log WARNING "Log index volume: no data returned — check that your Application Key has the 'usage_read' scope"
     fi
-    rm -f "$entries_file"
+    rm -f "$usage_elems"
 }
 
 # ── Query 4: Monitor Modifications ───────────────────────────────────────────
@@ -1687,21 +1812,13 @@ collect_monitor_modifications() {
     local raw_file=$(mktemp)
     local fails_before=$FAILED_API_CALLS
     audit_trail_query "@asset.type:monitor @evt.name:(\"Monitor Created\" OR \"Monitor Modified\")" "$raw_file"
-    if [[ $(jq 'length' "$raw_file" 2>/dev/null) == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
+    if [[ "$(json_len "$(cat "$raw_file")")" == "0" ]] && [[ $FAILED_API_CALLS -gt $fails_before ]]; then
         log WARNING "Monitor modifications: 0 results — Audit Trail API call failed. Ensure your Application Key has the 'audit_trail_read' scope in DataDog (Organization Settings → API Keys → Application Keys)."
     fi
 
-    jq '[group_by(.attributes.asset.id) | .[] | {
-        monitor_id: .[0].attributes.asset.id,
-        monitor_name: .[0].attributes.asset.name,
-        modification_count: length,
-        created_events: [.[] | select(.attributes.evt.name == "Monitor Created")] | length,
-        modified_events: [.[] | select(.attributes.evt.name == "Monitor Modified")] | length,
-        last_modified: (sort_by(.attributes.timestamp) | last | .attributes.timestamp),
-        modified_by: ([.[].attributes.usr.email] | unique)
-    }] | sort_by(-.modification_count)' "$raw_file" > "$OUTPUT_DIR/analytics/monitor_modifications.json" 2>/dev/null
+    _json_audit_aggregate "$(cat "$raw_file")" mods > "$OUTPUT_DIR/analytics/monitor_modifications.json"
 
-    local count=$(jq 'length' "$OUTPUT_DIR/analytics/monitor_modifications.json" 2>/dev/null)
+    local count=$(json_len "$(cat "$OUTPUT_DIR/analytics/monitor_modifications.json")")
     log SUCCESS "Monitor modifications: $count monitors with changes"
     rm -f "$raw_file"
 }
@@ -1710,9 +1827,10 @@ collect_monitor_modifications() {
 collect_unused_dashboards() {
     log INFO "Identifying unused dashboards..."
 
-    # Get all dashboard IDs from the export
-    local all_dashboards=$(find "$OUTPUT_DIR/dashboards" -name "dashboard-*.json" -exec jq -r '.id' {} \; 2>/dev/null | sort)
-    local total_dashboards=$(echo "$all_dashboards" | grep -c . || echo 0)
+    # Get all dashboard IDs from the export (no jq)
+    local all_dashboards=$(find "$OUTPUT_DIR/dashboards" -name "dashboard-*.json" -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do json_get "$(cat "$f")" id; echo; done | sort)
+    local total_dashboards=$(printf '%s' "$all_dashboards" | grep -c .)
 
     if [[ $total_dashboards -eq 0 ]]; then
         if [[ "$SKIP_DASHBOARDS" == "true" ]]; then
@@ -1724,35 +1842,30 @@ collect_unused_dashboards() {
         return
     fi
 
-    # Get viewed dashboard IDs from the views analytics
+    # Viewed dashboard IDs from the views analytics (top-level array → pluck)
     local viewed_ids=""
     if [[ -f "$OUTPUT_DIR/analytics/dashboard_views.json" ]]; then
-        viewed_ids=$(jq -r '.[].dashboard_id // empty' "$OUTPUT_DIR/analytics/dashboard_views.json" 2>/dev/null | sort)
+        viewed_ids=$(json_pluck "$(cat "$OUTPUT_DIR/analytics/dashboard_views.json")" dashboard_id | sort)
     fi
 
     # Find dashboards with zero views
-    local unused=$(comm -23 <(echo "$all_dashboards") <(echo "$viewed_ids"))
-    local unused_count=$(echo "$unused" | grep -c . || echo 0)
+    local unused=$(comm -23 <(printf '%s\n' "$all_dashboards") <(printf '%s\n' "$viewed_ids"))
+    local unused_count=$(printf '%s' "$unused" | grep -c .)
 
-    # Build JSON output with dashboard names
-    local unused_json="[]"
+    # Build JSON output with dashboard names (printf + json_escape)
+    local items=""
     while IFS= read -r dash_id; do
         [[ -z "$dash_id" ]] && continue
         local dash_file="$OUTPUT_DIR/dashboards/dashboard-${dash_id}.json"
-        local dash_name=""
-        if [[ -f "$dash_file" ]]; then
-            dash_name=$(jq -r '.title // "Unknown"' "$dash_file" 2>/dev/null)
-        fi
-        unused_json=$(echo "$unused_json" | jq --arg id "$dash_id" --arg name "$dash_name" '. + [{"dashboard_id": $id, "title": $name}]')
+        local dash_name="Unknown"
+        [[ -f "$dash_file" ]] && dash_name=$(json_get "$(cat "$dash_file")" title)
+        [[ -z "$dash_name" ]] && dash_name="Unknown"
+        items="${items}${items:+,}{\"dashboard_id\":\"$(json_escape "$dash_id")\",\"title\":\"$(json_escape "$dash_name")\"}"
     done <<< "$unused"
 
-    jq -n --argjson unused "$unused_json" --arg total "$total_dashboards" --arg count "$unused_count" '{
-        unused_dashboards: $unused,
-        total_dashboards: ($total | tonumber),
-        viewed_count: (($total | tonumber) - ($count | tonumber)),
-        unused_count: ($count | tonumber),
-        usage_period: "'"$USAGE_PERIOD"'"
-    }' > "$OUTPUT_DIR/analytics/unused_dashboards.json"
+    printf '{"unused_dashboards":[%s],"total_dashboards":%d,"viewed_count":%d,"unused_count":%d,"usage_period":"%s"}\n' \
+        "$items" "$total_dashboards" "$((total_dashboards - unused_count))" "$unused_count" "$(json_escape "$USAGE_PERIOD")" \
+        > "$OUTPUT_DIR/analytics/unused_dashboards.json"
 
     log SUCCESS "Unused dashboards: $unused_count of $total_dashboards never viewed in $USAGE_PERIOD"
 }
@@ -1761,8 +1874,9 @@ collect_unused_dashboards() {
 collect_unused_monitors() {
     log INFO "Identifying unused monitors..."
 
-    local all_monitors=$(find "$OUTPUT_DIR/monitors" -name "monitor-*.json" -exec jq -r '.id | tostring' {} \; 2>/dev/null | sort)
-    local total_monitors=$(echo "$all_monitors" | grep -c . || echo 0)
+    local all_monitors=$(find "$OUTPUT_DIR/monitors" -name "monitor-*.json" -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do json_get "$(cat "$f")" id; echo; done | sort)
+    local total_monitors=$(printf '%s' "$all_monitors" | grep -c .)
 
     if [[ $total_monitors -eq 0 ]]; then
         if [[ "$SKIP_MONITORS" == "true" ]]; then
@@ -1776,30 +1890,25 @@ collect_unused_monitors() {
 
     local triggered_ids=""
     if [[ -f "$OUTPUT_DIR/analytics/monitor_triggers.json" ]]; then
-        triggered_ids=$(jq -r '.[].monitor_id // empty' "$OUTPUT_DIR/analytics/monitor_triggers.json" 2>/dev/null | sort)
+        triggered_ids=$(json_pluck "$(cat "$OUTPUT_DIR/analytics/monitor_triggers.json")" monitor_id | sort)
     fi
 
-    local unused=$(comm -23 <(echo "$all_monitors") <(echo "$triggered_ids"))
-    local unused_count=$(echo "$unused" | grep -c . || echo 0)
+    local unused=$(comm -23 <(printf '%s\n' "$all_monitors") <(printf '%s\n' "$triggered_ids"))
+    local unused_count=$(printf '%s' "$unused" | grep -c .)
 
-    local unused_json="[]"
+    local items=""
     while IFS= read -r mon_id; do
         [[ -z "$mon_id" ]] && continue
         local mon_file="$OUTPUT_DIR/monitors/monitor-${mon_id}.json"
-        local mon_name=""
-        if [[ -f "$mon_file" ]]; then
-            mon_name=$(jq -r '.name // "Unknown"' "$mon_file" 2>/dev/null)
-        fi
-        unused_json=$(echo "$unused_json" | jq --arg id "$mon_id" --arg name "$mon_name" '. + [{"monitor_id": $id, "name": $name}]')
+        local mon_name="Unknown"
+        [[ -f "$mon_file" ]] && mon_name=$(json_get "$(cat "$mon_file")" name)
+        [[ -z "$mon_name" ]] && mon_name="Unknown"
+        items="${items}${items:+,}{\"monitor_id\":\"$(json_escape "$mon_id")\",\"name\":\"$(json_escape "$mon_name")\"}"
     done <<< "$unused"
 
-    jq -n --argjson unused "$unused_json" --arg total "$total_monitors" --arg count "$unused_count" '{
-        unused_monitors: $unused,
-        total_monitors: ($total | tonumber),
-        triggered_count: (($total | tonumber) - ($count | tonumber)),
-        unused_count: ($count | tonumber),
-        usage_period: "'"$USAGE_PERIOD"'"
-    }' > "$OUTPUT_DIR/analytics/unused_monitors.json"
+    printf '{"unused_monitors":[%s],"total_monitors":%d,"triggered_count":%d,"unused_count":%d,"usage_period":"%s"}\n' \
+        "$items" "$total_monitors" "$((total_monitors - unused_count))" "$unused_count" "$(json_escape "$USAGE_PERIOD")" \
+        > "$OUTPUT_DIR/analytics/unused_monitors.json"
 
     log SUCCESS "Unused monitors: $unused_count of $total_monitors never triggered in $USAGE_PERIOD"
 }
@@ -1823,30 +1932,17 @@ collect_usage_analytics() {
     collect_unused_dashboards
     collect_unused_monitors
 
-    # Write analytics summary
-    jq -n \
-        --arg period "$USAGE_PERIOD" \
-        --arg from "$(get_usage_from_timestamp)" \
-        --arg to "$(get_usage_to_timestamp)" \
-        --argjson dv "$(jq 'length' "$OUTPUT_DIR/analytics/dashboard_views.json" 2>/dev/null || echo 0)" \
-        --argjson mt "$(jq 'length' "$OUTPUT_DIR/analytics/monitor_triggers.json" 2>/dev/null || echo 0)" \
-        --argjson iv "$(jq '.indexes | length' "$OUTPUT_DIR/analytics/log_index_volume.json" 2>/dev/null || echo 0)" \
-        --argjson mm "$(jq 'length' "$OUTPUT_DIR/analytics/monitor_modifications.json" 2>/dev/null || echo 0)" \
-        --argjson ud "$(jq '.unused_count' "$OUTPUT_DIR/analytics/unused_dashboards.json" 2>/dev/null || echo 0)" \
-        --argjson um "$(jq '.unused_count' "$OUTPUT_DIR/analytics/unused_monitors.json" 2>/dev/null || echo 0)" \
-        '{
-            usage_period: $period,
-            from: $from,
-            to: $to,
-            queries: {
-                dashboard_views: { dashboards_with_views: $dv },
-                monitor_triggers: { monitors_with_triggers: $mt },
-                log_index_volume: { indexes_with_data: $iv },
-                monitor_modifications: { monitors_modified: $mm },
-                unused_dashboards: { count: $ud },
-                unused_monitors: { count: $um }
-            }
-        }' > "$OUTPUT_DIR/analytics/_summary.json"
+    # Write analytics summary (printf + helpers, no jq)
+    local a="$OUTPUT_DIR/analytics"
+    local dv=$(json_len "$(cat "$a/dashboard_views.json" 2>/dev/null)")
+    local mt=$(json_len "$(cat "$a/monitor_triggers.json" 2>/dev/null)")
+    local iv=$(json_len "$(json_get_raw "$(cat "$a/log_index_volume.json" 2>/dev/null)" indexes)")
+    local mm=$(json_len "$(cat "$a/monitor_modifications.json" 2>/dev/null)")
+    local ud=$(json_get "$(cat "$a/unused_dashboards.json" 2>/dev/null)" unused_count); ud=${ud:-0}
+    local um=$(json_get "$(cat "$a/unused_monitors.json" 2>/dev/null)" unused_count); um=${um:-0}
+    printf '{"usage_period":"%s","from":"%s","to":"%s","queries":{"dashboard_views":{"dashboards_with_views":%d},"monitor_triggers":{"monitors_with_triggers":%d},"log_index_volume":{"indexes_with_data":%d},"monitor_modifications":{"monitors_modified":%d},"unused_dashboards":{"count":%d},"unused_monitors":{"count":%d}}}\n' \
+        "$(json_escape "$USAGE_PERIOD")" "$(json_escape "$(get_usage_from_timestamp)")" "$(json_escape "$(get_usage_to_timestamp)")" \
+        "$dv" "$mt" "$iv" "$mm" "$ud" "$um" > "$a/_summary.json"
 
     log SUCCESS "Usage analytics complete — results in analytics/"
 }
