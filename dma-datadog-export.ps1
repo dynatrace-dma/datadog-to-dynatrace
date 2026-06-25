@@ -813,27 +813,62 @@ function Export-Synthetics {
     $dir = Join-Path $script:OutputDir "synthetics"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
+    # Page through the list endpoint (page_size=5000 = DataDog max). The list
+    # response already carries the full `config` for API tests, so the 80%+ that
+    # are API tests need NO per-test fetch — only browser tests must be fetched
+    # individually because their `steps` are NOT in the list. (Parity with the
+    # bash exporter's export_synthetics.)
     Write-Log INFO "Fetching synthetic tests..."
-    $data = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/synthetics/tests" `
-        -OutputFile (Join-Path $dir "_list.json")
-    if ($null -eq $data) { Write-Log ERROR "Failed to fetch synthetic tests"; return }
+    $allTests = [System.Collections.Generic.List[object]]::new()
+    $page = 0
+    $pageSize = 5000
+    while ($true) {
+        $data = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/synthetics/tests?page=$page&page_size=$pageSize"
+        if ($null -eq $data) { Write-Log WARNING "Failed to fetch synthetic tests at page $page"; break }
+        $batch = if ($data.tests) { @($data.tests) } else { @() }
+        if ($batch.Count -eq 0) { break }
+        foreach ($t in $batch) { $allTests.Add($t) }
+        $page++
+        if ($batch.Count -lt $pageSize) { break }
+    }
 
-    $items = if ($data.tests) { @($data.tests) } else { @() }
-    if ($items.Count -eq 0) {
+    # Persist the master list exactly like the bash exporter: {"tests":[...]}.
+    Write-JsonFile -Path (Join-Path $dir "_list.json") -Content (@{ tests = @($allTests) } | ConvertTo-Json -Depth 100)
+
+    $count = $allTests.Count
+    if ($count -eq 0) {
         Track-EmptyResult -ResourceType "synthetic tests" -ScopeName "synthetics_read"
-    } else {
-        Write-Log SUCCESS "Found $($items.Count) synthetic tests"
+        return
     }
-    if ($items.Count -gt 0) {
-        Write-Log INFO "Fetching $($items.Count) synthetic tests concurrently (full step definitions)..."
+    Write-Log SUCCESS "Found $count synthetic tests"
+
+    # API tests (and every other type): write straight from the list — the full
+    # `config` is already present, so no per-test fetch is needed.
+    Write-Log INFO "Writing $count synthetic tests from list..."
+    foreach ($t in $allTests) {
+        $publicId = "$($t.public_id)"
+        if ([string]::IsNullOrWhiteSpace($publicId)) { continue }
+        Write-JsonFile -Path (Join-Path $dir "test-$publicId.json") -Content ($t | ConvertTo-Json -Depth 100)
+    }
+
+    # Browser tests are the exception: their `steps` are NOT in the list config
+    # and only come from /synthetics/tests/browser/{id}. Fetch those concurrently
+    # and overwrite the list-derived file with the steps-included full object.
+    $browserIds = @(
+        $allTests |
+            Where-Object { "$($_.type)" -eq 'browser' } |
+            ForEach-Object { "$($_.public_id)" } |
+            Where-Object { $_ -and $_.Trim() -ne "" }
+    )
+    if ($browserIds.Count -gt 0) {
+        Write-Log INFO "Fetching $($browserIds.Count) browser tests with full steps (concurrent)..."
         Invoke-IdsConcurrent -MaxParallel $script:SyntheticsConcurrency `
-            -UrlTemplate "/api/v1/synthetics/tests/__ID__" `
+            -UrlTemplate "/api/v1/synthetics/tests/browser/__ID__" `
             -OutFileTemplate (Join-Path $dir "test-__ID__.json") `
-            -Ids @($items | ForEach-Object { "$($_.public_id)" })
-        $exported = (Get-ChildItem -Path $dir -Filter "test-*.json" -ErrorAction SilentlyContinue).Count
-        $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
-        Write-Log SUCCESS "Exported $exported / $($items.Count) synthetic tests"
+            -Ids $browserIds
     }
+
+    Write-Log SUCCESS "Exported $count synthetic tests ($($browserIds.Count) browser w/ full steps)"
 }
 
 function Export-SLOs {
