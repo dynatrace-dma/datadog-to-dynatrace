@@ -184,6 +184,19 @@ $script:DashboardConcurrency  = if (($env:DASHBOARD_CONCURRENCY  -as [int]) -gt 
 $script:SyntheticsConcurrency = if (($env:SYNTHETICS_CONCURRENCY -as [int]) -gt 0) { [int]$env:SYNTHETICS_CONCURRENCY } else { 10 }
 $script:LogsConcurrency       = if (($env:LOGS_CONCURRENCY       -as [int]) -gt 0) { [int]$env:LOGS_CONCURRENCY }       else { 5 }
 
+# Paced-batch parameters for Invoke-IdsConcurrent (parity with bash defaults).
+# IDs are split into fixed-size batches; each batch drains the RunspacePool fully,
+# then Start-Sleep separates it from the next — keeping the effective rate safely
+# below each endpoint's measured limit. Retry pass uses 30 % of the initial batch
+# size (floor 5), 2× the delay, and $RetryConcurrency parallel connections.
+$script:DashboardBatchSize    = if (($env:DASHBOARD_BATCH_SIZE   -as [int]) -gt 0) { [int]$env:DASHBOARD_BATCH_SIZE }   else { 50  }
+$script:DashboardBatchDelay   = if (($env:DASHBOARD_BATCH_DELAY  -as [int]) -gt 0) { [int]$env:DASHBOARD_BATCH_DELAY }  else { 7   }
+$script:SyntheticsBatchSize   = if (($env:SYNTHETICS_BATCH_SIZE  -as [int]) -gt 0) { [int]$env:SYNTHETICS_BATCH_SIZE }  else { 100 }
+$script:SyntheticsBatchDelay  = if (($env:SYNTHETICS_BATCH_DELAY -as [int]) -gt 0) { [int]$env:SYNTHETICS_BATCH_DELAY } else { 5   }
+$script:LogsBatchSize         = if (($env:LOGS_BATCH_SIZE        -as [int]) -gt 0) { [int]$env:LOGS_BATCH_SIZE }        else { 30  }
+$script:LogsBatchDelay        = if (($env:LOGS_BATCH_DELAY       -as [int]) -gt 0) { [int]$env:LOGS_BATCH_DELAY }       else { 6   }
+$script:RetryConcurrency      = if (($env:RETRY_CONCURRENCY      -as [int]) -gt 0) { [int]$env:RETRY_CONCURRENCY }      else { 3   }
+
 # Silent failure tracking (200 OK but empty results)
 $script:EmptyResultsWarnings = @()
 $script:SuspiciousEmptyCount = 0
@@ -386,30 +399,47 @@ function Invoke-DataDogApi {
 # Relies on the process-global ServicePointManager TLS 1.2 + cert policy set at
 # script init (inherited by in-process runspaces). Do NOT move those per-call.
 #
-#   -MaxParallel      in-flight connection cap (throttle)
+#   -MaxParallel      in-flight connection cap per batch
 #   -UrlTemplate      API path containing the literal token __ID__
 #   -OutFileTemplate  absolute output path containing the literal token __ID__
-#   -Ids              ids to fetch (blank/whitespace entries skipped)
+#   -Ids              IDs to fetch (blank/whitespace entries skipped)
+#   -BatchSize        IDs per RunspacePool dispatch  [default: 50]
+#   -BatchDelaySec    seconds between batches        [default: 7]
+#
+# IDs are split into fixed-size batches. Each batch is dispatched through a
+# single RunspacePool (capped at -MaxParallel threads) that drains fully before
+# the next batch starts. Start-Sleep -Seconds BatchDelaySec separates consecutive
+# batches (skipped after the last one). Show-Progress is called after each batch.
+#
+# A retry pass runs after all batches complete. Failed IDs are retried in smaller
+# batches (30 % of BatchSize, floor 5) at lower concurrency ($script:RetryConcurrency)
+# and a longer delay (2× BatchDelaySec), also with live Show-Progress output.
 # ---------------------------------------------------------------------------
 function Invoke-IdsConcurrent {
     param(
         [int]$MaxParallel,
         [string]$UrlTemplate,
         [string]$OutFileTemplate,
-        [string[]]$Ids
+        [string[]]$Ids,
+        [int]$BatchSize     = 50,
+        [int]$BatchDelaySec = 7
     )
 
     $clean = @($Ids | Where-Object { $_ -and "$_".Trim() -ne "" })
     if ($clean.Count -eq 0) { return }
-    if ($MaxParallel -le 0) { $MaxParallel = 8 }
+    if ($MaxParallel   -le 0) { $MaxParallel   = 8  }
+    if ($BatchSize     -le 0) { $BatchSize     = 50 }
+    if ($BatchDelaySec -lt 0) { $BatchDelaySec = 0  }
 
-    Write-Log DEBUG "  runspace pool max-parallel=$MaxParallel for $($clean.Count) items"
-
+    $total   = $clean.Count
     $apiBase = $script:DatadogApiUrl
     $apiKey  = $script:DatadogApiKey
     $appKey  = $script:DatadogAppKey
 
-    # Self-contained worker - no access to $script:* (runspaces don't share it).
+    Write-Log DEBUG "fetch-by-id: total=$total  MaxParallel=$MaxParallel  BatchSize=$BatchSize  BatchDelay=${BatchDelaySec}s"
+
+    # Self-contained worker — no access to $script:* (runspaces don't share it).
+    # On 429 writes a sentinel so the retry pass can identify the failure.
     $worker = {
         param($Url, $OutFile, $ApiKey, $AppKey)
         $headers = @{
@@ -430,65 +460,96 @@ function Invoke-IdsConcurrent {
         }
     }
 
+    # -------------------------------------------------------------------------
+    # Phase 1: paced batch fetch — one RunspacePool for the entire phase.
+    # -------------------------------------------------------------------------
     $pool = [runspacefactory]::CreateRunspacePool(1, $MaxParallel)
     $pool.Open()
-    $jobs = [System.Collections.Generic.List[object]]::new()
     try {
-        foreach ($id in $clean) {
-            $url = $apiBase + ($UrlTemplate -replace '__ID__', $id)
-            $out = ($OutFileTemplate -replace '__ID__', $id)
-            $ps  = [powershell]::Create()
-            $ps.RunspacePool = $pool
-            [void]$ps.AddScript($worker).AddArgument($url).AddArgument($out).AddArgument($apiKey).AddArgument($appKey)
-            $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
-        }
-        foreach ($j in $jobs) {
-            try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
-            $j.PS.Dispose()
+        $batchStart = 0
+        while ($batchStart -lt $total) {
+            $batchEnd = [Math]::Min($batchStart + $BatchSize, $total)
+            $batch    = $clean[$batchStart..($batchEnd - 1)]
+
+            $jobs = [System.Collections.Generic.List[object]]::new()
+            foreach ($id in $batch) {
+                $url = $apiBase + ($UrlTemplate    -replace '__ID__', $id)
+                $out =            $OutFileTemplate -replace '__ID__', $id
+                $ps  = [powershell]::Create()
+                $ps.RunspacePool = $pool
+                [void]$ps.AddScript($worker).AddArgument($url).AddArgument($out).AddArgument($apiKey).AddArgument($appKey)
+                $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
+            }
+            foreach ($j in $jobs) {
+                try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
+                $j.PS.Dispose()
+            }
+
+            Show-Progress $batchEnd $total
+
+            $batchStart = $batchEnd
+            if ($batchStart -lt $total) { Start-Sleep -Seconds $BatchDelaySec }
         }
     } finally {
         $pool.Close(); $pool.Dispose()
     }
+    Write-Host ""
 
-    # Phase 2 - sequential retry of rate-limited / missing items.
-    $headers = @{
-        'DD-API-KEY'         = $apiKey
-        'DD-APPLICATION-KEY' = $appKey
-        'Content-Type'       = 'application/json'
-    }
-    $retry = @()
+    # -------------------------------------------------------------------------
+    # Phase 2: paced batch retry for any 429 or missing items
+    # -------------------------------------------------------------------------
+    $retryList = [System.Collections.Generic.List[string]]::new()
     foreach ($id in $clean) {
-        $out = ($OutFileTemplate -replace '__ID__', $id)
+        $out = $OutFileTemplate -replace '__ID__', $id
         if (-not (Test-Path $out)) {
-            $retry += $id
+            $retryList.Add($id)
         } elseif ((Get-Content -Path $out -Raw) -match '"__ratelimited__":429') {
             Remove-Item $out -Force
-            $retry += $id
+            $retryList.Add($id)
         }
     }
 
-    if ($retry.Count -gt 0) {
-        Write-Log WARNING "  Rate-limited on $($retry.Count) item(s) - retrying with backoff..."
-        foreach ($id in $retry) {
-            $url = $apiBase + ($UrlTemplate -replace '__ID__', $id)
-            $out = ($OutFileTemplate -replace '__ID__', $id)
-            $attempt = 0
-            while ($attempt -lt 5) {
-                try {
-                    $resp = Invoke-WebRequest -Uri $url -Method GET -Headers $headers `
-                        -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
-                    [System.IO.File]::WriteAllText($out, $resp.Content, [System.Text.UTF8Encoding]::new($false))
-                    break
-                } catch {
-                    $code = 0
-                    if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-                    if     ($code -eq 429) { Start-Sleep -Seconds (10 + (Get-Random -Maximum 5)); $attempt++ }
-                    elseif ($code -ge 500) { Start-Sleep -Seconds (3 + (Get-Random -Maximum 3));  $attempt++ }
-                    else { if (Test-Path $out) { Remove-Item $out -Force }; break }
-                }
+    if ($retryList.Count -eq 0) { return }
+
+    $retryArr   = $retryList.ToArray()
+    $retryTotal = $retryArr.Count
+    $retryBatch = [Math]::Max(5, [int]($BatchSize * 0.3))
+    $retryDelay = $BatchDelaySec * 2
+    $retryConc  = $script:RetryConcurrency
+
+    Write-Log WARNING "  Rate-limited on $retryTotal item(s) — retrying in paced batches (batch=$retryBatch, delay=${retryDelay}s, concurrency=$retryConc)..."
+
+    $rPool = [runspacefactory]::CreateRunspacePool(1, $retryConc)
+    $rPool.Open()
+    try {
+        $retryStart = 0
+        while ($retryStart -lt $retryTotal) {
+            $retryEnd   = [Math]::Min($retryStart + $retryBatch, $retryTotal)
+            $retrySlice = $retryArr[$retryStart..($retryEnd - 1)]
+
+            $jobs = [System.Collections.Generic.List[object]]::new()
+            foreach ($id in $retrySlice) {
+                $url = $apiBase + ($UrlTemplate    -replace '__ID__', $id)
+                $out =            $OutFileTemplate -replace '__ID__', $id
+                $ps  = [powershell]::Create()
+                $ps.RunspacePool = $rPool
+                [void]$ps.AddScript($worker).AddArgument($url).AddArgument($out).AddArgument($apiKey).AddArgument($appKey)
+                $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
             }
+            foreach ($j in $jobs) {
+                try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
+                $j.PS.Dispose()
+            }
+
+            Show-Progress $retryEnd $retryTotal
+
+            $retryStart = $retryEnd
+            if ($retryStart -lt $retryTotal) { Start-Sleep -Seconds $retryDelay }
         }
+    } finally {
+        $rPool.Close(); $rPool.Dispose()
     }
+    Write-Host ""
 }
 
 # =============================================================================
@@ -727,7 +788,9 @@ function Export-Dashboards {
         Invoke-IdsConcurrent -MaxParallel $script:DashboardConcurrency `
             -UrlTemplate "/api/v1/dashboard/__ID__" `
             -OutFileTemplate (Join-Path $dir "dashboard-__ID__.json") `
-            -Ids @($items | ForEach-Object { "$($_.id)" })
+            -Ids @($items | ForEach-Object { "$($_.id)" }) `
+            -BatchSize $script:DashboardBatchSize `
+            -BatchDelaySec $script:DashboardBatchDelay
         $exported = (Get-ChildItem -Path $dir -Filter "dashboard-*.json" -ErrorAction SilentlyContinue).Count
         $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
         Write-Log SUCCESS "Exported $exported / $($items.Count) dashboards"
@@ -783,7 +846,9 @@ function Export-LogsConfig {
             Invoke-IdsConcurrent -MaxParallel $script:LogsConcurrency `
                 -UrlTemplate "/api/v1/logs/config/pipelines/__ID__" `
                 -OutFileTemplate (Join-Path $pipDir "pipeline-__ID__.json") `
-                -Ids @($items | ForEach-Object { "$($_.id)" })
+                -Ids @($items | ForEach-Object { "$($_.id)" }) `
+                -BatchSize $script:LogsBatchSize `
+                -BatchDelaySec $script:LogsBatchDelay
             $exported = (Get-ChildItem -Path $pipDir -Filter "pipeline-*.json" -ErrorAction SilentlyContinue).Count
             $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
             Write-Log SUCCESS "Exported $exported / $($items.Count) log pipelines"
@@ -865,7 +930,9 @@ function Export-Synthetics {
         Invoke-IdsConcurrent -MaxParallel $script:SyntheticsConcurrency `
             -UrlTemplate "/api/v1/synthetics/tests/browser/__ID__" `
             -OutFileTemplate (Join-Path $dir "test-__ID__.json") `
-            -Ids $browserIds
+            -Ids $browserIds `
+            -BatchSize $script:SyntheticsBatchSize `
+            -BatchDelaySec $script:SyntheticsBatchDelay
     }
 
     Write-Log SUCCESS "Exported $count synthetic tests ($($browserIds.Count) browser w/ full steps)"
