@@ -189,6 +189,19 @@ DASHBOARD_CONCURRENCY="${DASHBOARD_CONCURRENCY:-10}"    # limit 600/60s  (10/s)
 SYNTHETICS_CONCURRENCY="${SYNTHETICS_CONCURRENCY:-10}"  # limit 1450/60s (24/s)
 LOGS_CONCURRENCY="${LOGS_CONCURRENCY:-5}"               # limit 420/60s  (7/s)
 
+# Paced-batch parameters for fetch_ids_concurrent.
+# IDs are split into fixed-size batches; each batch fires as one parallel curl
+# invocation, then sleeps BATCH_DELAY seconds before the next — keeping the
+# effective rate safely below each endpoint's measured limit.
+# Retry pass uses 30 % of the initial batch size, 2× the delay, RETRY_CONCURRENCY.
+DASHBOARD_BATCH_SIZE="${DASHBOARD_BATCH_SIZE:-50}"      # IDs per curl dispatch
+DASHBOARD_BATCH_DELAY="${DASHBOARD_BATCH_DELAY:-7}"     # seconds between batches
+SYNTHETICS_BATCH_SIZE="${SYNTHETICS_BATCH_SIZE:-100}"
+SYNTHETICS_BATCH_DELAY="${SYNTHETICS_BATCH_DELAY:-5}"
+LOGS_BATCH_SIZE="${LOGS_BATCH_SIZE:-30}"
+LOGS_BATCH_DELAY="${LOGS_BATCH_DELAY:-6}"
+RETRY_CONCURRENCY="${RETRY_CONCURRENCY:-3}"             # concurrency for all retry passes
+
 # Progress tracking
 TOTAL_STEPS=0
 CURRENT_STEP=0
@@ -773,19 +786,35 @@ _json_usage_flatten() {
 #
 # Requirements: curl 7.66+ (ships with macOS Monterey+; verified 8.7.1 here).
 #
-#   $1 = max parallel connections (tuned per endpoint's x-ratelimit-limit)
+#   $1 = max parallel connections per batch
 #   $2 = URL path template containing the literal token __ID__
 #   $3 = output file path template containing the literal token __ID__
+#   $4 = batch size — IDs per curl dispatch        [default: 50]
+#   $5 = inter-batch delay in seconds              [default: 7]
 #   stdin = newline-separated IDs
+#
+# IDs are split into fixed-size batches. Each batch fires as one curl
+# --parallel invocation (capped at $1 connections), then sleeps $5 seconds
+# before the next batch starts. This keeps the effective request rate safely
+# below each endpoint's measured limit regardless of individual response time.
+# show_progress is called after every batch so the operator sees live progress.
+#
+# A single retry pass runs after all batches complete. Failed IDs are retried
+# in smaller batches (30 % of $4, floor 5) at lower concurrency ($RETRY_CONCURRENCY)
+# and a longer inter-batch delay (2× $5), also with live progress.
 # ---------------------------------------------------------------------------
 fetch_ids_concurrent() {
     local max_parallel="$1"
     local url_tmpl="$2"
     local out_tmpl="$3"
+    local batch_size="${4:-50}"
+    local batch_delay="${5:-7}"
 
     [[ "$max_parallel" =~ ^[0-9]+$ ]] && [ "$max_parallel" -gt 0 ] || max_parallel=8
+    [[ "$batch_size"   =~ ^[0-9]+$ ]] && [ "$batch_size"   -gt 0 ] || batch_size=50
+    [[ "$batch_delay"  =~ ^[0-9]+$ ]] && [ "$batch_delay"  -ge 0 ] || batch_delay=7
 
-    # Collect IDs, skip blanks
+    # Collect IDs from stdin, skip blanks.
     local ids=()
     while IFS= read -r id; do
         [ -z "${id//[[:space:]]/}" ] && continue
@@ -795,31 +824,44 @@ fetch_ids_concurrent() {
     local total="${#ids[@]}"
     [ "$total" -eq 0 ] && return 0
 
-    # Build a curl config file: one entry per ID separated by --next.
-    # curl --parallel dispatches all entries concurrently inside a single process
-    # (no forking, no extra bash subprocesses, no file-descriptor pressure).
-    # 429 detection is done post-run by inspecting the output files.
-    local cfg_file; cfg_file="$(mktemp)"
-    local id url out first=1
-    for id in "${ids[@]}"; do
-        url="${DATADOG_API_URL}${url_tmpl//__ID__/$id}"
-        out="${out_tmpl//__ID__/$id}"
-        if [ "$first" = "1" ]; then
-            first=0
-        else
-            printf -- '--next\n' >> "$cfg_file"
-        fi
-        printf -- '--url "%s"\n--output "%s"\n--header "DD-API-KEY: %s"\n--header "DD-APPLICATION-KEY: %s"\n--header "Content-Type: application/json"\n' \
-            "$url" "$out" "${DATADOG_API_KEY}" "${DATADOG_APP_KEY}" >> "$cfg_file"
+    # -------------------------------------------------------------------------
+    # Phase 1: paced batch fetch
+    # -------------------------------------------------------------------------
+    local batch_start=0
+    while [ "$batch_start" -lt "$total" ]; do
+        local batch_end=$(( batch_start + batch_size ))
+        [ "$batch_end" -gt "$total" ] && batch_end="$total"
+
+        local cfg_file; cfg_file="$(mktemp)"
+        local first=1 i
+        for (( i=batch_start; i<batch_end; i++ )); do
+            local id="${ids[$i]}"
+            local url="${DATADOG_API_URL}${url_tmpl//__ID__/$id}"
+            local out="${out_tmpl//__ID__/$id}"
+            if [ "$first" = "1" ]; then
+                first=0
+            else
+                printf -- '--next\n' >> "$cfg_file"
+            fi
+            printf -- '--url "%s"\n--output "%s"\n--header "DD-API-KEY: %s"\n--header "DD-APPLICATION-KEY: %s"\n--header "Content-Type: application/json"\n' \
+                "$url" "$out" "${DATADOG_API_KEY}" "${DATADOG_APP_KEY}" >> "$cfg_file"
+        done
+
+        curl -s --parallel --parallel-max "$max_parallel" --config "$cfg_file"
+        rm -f "$cfg_file"
+
+        show_progress "$batch_end" "$total"
+
+        batch_start="$batch_end"
+        [ "$batch_start" -lt "$total" ] && sleep "$batch_delay"
     done
+    echo ""
 
-    # First pass: fire all requests in parallel inside one curl process.
-    curl -s --parallel --parallel-max "$max_parallel" --config "$cfg_file"
-    rm -f "$cfg_file"
-
-    # Retry pass: any output file that contains a 429 JSON body (or is absent)
-    # means the item was rate-limited. Re-fetch sequentially with backoff.
-    local retry_ids=() attempt
+    # -------------------------------------------------------------------------
+    # Phase 2: paced batch retry for any 429 or missing items
+    # -------------------------------------------------------------------------
+    local retry_ids=()
+    local id out
     for id in "${ids[@]}"; do
         out="${out_tmpl//__ID__/$id}"
         if [ ! -f "$out" ] || grep -q '"status":429\|"errors":\["Too many requests' "$out" 2>/dev/null; then
@@ -828,27 +870,44 @@ fetch_ids_concurrent() {
         fi
     done
 
-    if [ "${#retry_ids[@]}" -gt 0 ]; then
-        log WARNING "  Rate-limited on ${#retry_ids[@]} items — retrying with backoff..."
-        for id in "${retry_ids[@]}"; do
-            url="${DATADOG_API_URL}${url_tmpl//__ID__/$id}"
-            out="${out_tmpl//__ID__/$id}"
-            attempt=0
-            while [ "$attempt" -lt 5 ]; do
-                local code; code="$(curl -s -o "$out" -w "%{http_code}" \
-                    -H "DD-API-KEY: ${DATADOG_API_KEY}" \
-                    -H "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
-                    -H "Content-Type: application/json" \
-                    "$url")"
-                case "$code" in
-                    200|201) break ;;
-                    429) sleep $(( 10 + (RANDOM % 5) )); attempt=$((attempt+1)) ;;
-                    5*) sleep $(( 3 + (RANDOM % 3) )); attempt=$((attempt+1)) ;;
-                    *) rm -f "$out"; break ;;
-                esac
-            done
+    [ "${#retry_ids[@]}" -eq 0 ] && return 0
+
+    local retry_total="${#retry_ids[@]}"
+    local retry_batch_size=$(( batch_size * 30 / 100 ))
+    [ "$retry_batch_size" -lt 5 ] && retry_batch_size=5
+    local retry_delay=$(( batch_delay * 2 ))
+
+    log WARNING "  Rate-limited on $retry_total items — retrying in paced batches (batch=$retry_batch_size, delay=${retry_delay}s, concurrency=$RETRY_CONCURRENCY)..."
+
+    local retry_start=0
+    while [ "$retry_start" -lt "$retry_total" ]; do
+        local retry_end=$(( retry_start + retry_batch_size ))
+        [ "$retry_end" -gt "$retry_total" ] && retry_end="$retry_total"
+
+        local cfg_file; cfg_file="$(mktemp)"
+        local first=1 i
+        for (( i=retry_start; i<retry_end; i++ )); do
+            local id="${retry_ids[$i]}"
+            local url="${DATADOG_API_URL}${url_tmpl//__ID__/$id}"
+            local out="${out_tmpl//__ID__/$id}"
+            if [ "$first" = "1" ]; then
+                first=0
+            else
+                printf -- '--next\n' >> "$cfg_file"
+            fi
+            printf -- '--url "%s"\n--output "%s"\n--header "DD-API-KEY: %s"\n--header "DD-APPLICATION-KEY: %s"\n--header "Content-Type: application/json"\n' \
+                "$url" "$out" "${DATADOG_API_KEY}" "${DATADOG_APP_KEY}" >> "$cfg_file"
         done
-    fi
+
+        curl -s --parallel --parallel-max "$RETRY_CONCURRENCY" --config "$cfg_file"
+        rm -f "$cfg_file"
+
+        show_progress "$retry_end" "$retry_total"
+
+        retry_start="$retry_end"
+        [ "$retry_start" -lt "$retry_total" ] && sleep "$retry_delay"
+    done
+    echo ""
 }
 
 # ---------------------------------------------------------------------------
@@ -1065,7 +1124,8 @@ export_dashboards() {
         log INFO "Fetching $count dashboards concurrently (full widget definitions)..."
         echo "$dashboard_ids" | fetch_ids_concurrent "$DASHBOARD_CONCURRENCY" \
             "/api/v1/dashboard/__ID__" \
-            "$dashboards_dir/dashboard-__ID__.json"
+            "$dashboards_dir/dashboard-__ID__.json" \
+            "$DASHBOARD_BATCH_SIZE" "$DASHBOARD_BATCH_DELAY"
 
         local exported=$(ls "$dashboards_dir"/dashboard-*.json 2>/dev/null | wc -l | tr -d ' ')
         TOTAL_API_CALLS=$((TOTAL_API_CALLS + exported))
@@ -1197,7 +1257,8 @@ export_logs_config() {
             log INFO "Fetching $count log pipelines concurrently..."
             echo "$pipeline_ids" | fetch_ids_concurrent "$LOGS_CONCURRENCY" \
                 "/api/v1/logs/config/pipelines/__ID__" \
-                "$logs_dir/pipelines/pipeline-__ID__.json"
+                "$logs_dir/pipelines/pipeline-__ID__.json" \
+                "$LOGS_BATCH_SIZE" "$LOGS_BATCH_DELAY"
             log SUCCESS "Exported $count log pipelines"
         fi
     else
@@ -1316,7 +1377,8 @@ export_synthetics() {
             log INFO "Fetching $browser_count browser tests with full steps (concurrent)..."
             echo "$browser_ids" | fetch_ids_concurrent "$SYNTHETICS_CONCURRENCY" \
                 "/api/v1/synthetics/tests/browser/__ID__" \
-                "$synthetics_dir/test-__ID__.json"
+                "$synthetics_dir/test-__ID__.json" \
+                "$SYNTHETICS_BATCH_SIZE" "$SYNTHETICS_BATCH_DELAY"
         fi
 
         log SUCCESS "Exported $count synthetic tests ($browser_count browser w/ full steps)"
