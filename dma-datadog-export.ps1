@@ -803,23 +803,39 @@ function Export-Monitors {
     $dir = Join-Path $script:OutputDir "monitors"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-    Write-Log INFO "Fetching monitor list..."
-    $list = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/monitor" -OutputFile (Join-Path $dir "_list.json")
-    if ($null -eq $list) { Write-Log ERROR "Failed to fetch monitor list"; return }
+    # Paginate the monitor list. The API returns full monitor detail in the list
+    # response, so individual re-fetches are not needed — mirrors bash behaviour
+    # and avoids N extra API calls that could trigger rate limits.
+    Write-Log INFO "Fetching monitor list (paginated)..."
+    $allItems = [System.Collections.Generic.List[object]]::new()
+    $page = 0
+    $pageSize = 5000
+    do {
+        $batch = Invoke-DataDogApi -Method GET `
+            -Endpoint "/api/v1/monitor?page=${page}&page_size=${pageSize}"
+        if ($null -eq $batch -or -not ($batch -is [array]) -or $batch.Count -eq 0) { break }
+        foreach ($m in $batch) { [void]$allItems.Add($m) }
+        $page++
+    } while ($batch.Count -ge $pageSize)
 
-    $items = if ($list -is [array]) { $list } else { @() }
-    if ($items.Count -eq 0) {
+    Write-JsonObject -Path (Join-Path $dir "_list.json") -Object $allItems.ToArray()
+
+    if ($allItems.Count -eq 0) {
         Track-EmptyResult -ResourceType "monitors" -ScopeName "monitors_read"
-    } else {
-        Write-Log SUCCESS "Found $($items.Count) monitors"
+        return
     }
+    Write-Log SUCCESS "Found $($allItems.Count) monitors"
+
+    # Extract individual monitor files directly from the list — no additional API calls.
+    Write-Log INFO "Extracting $($allItems.Count) individual monitor files from list..."
     $i = 0
-    foreach ($m in $items) {
-        $i++; Show-Progress $i $items.Count
-        Invoke-DataDogApi -Method GET -Endpoint "/api/v1/monitor/$($m.id)" `
-            -OutputFile (Join-Path $dir "monitor-$($m.id).json") | Out-Null
+    foreach ($m in $allItems) {
+        $i++
+        Show-Progress $i $allItems.Count
+        Write-JsonObject -Path (Join-Path $dir "monitor-$($m.id).json") -Object $m
     }
-    if ($items.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($items.Count) monitors" }
+    Write-Host ""
+    Write-Log SUCCESS "Exported $($allItems.Count) monitors"
 }
 
 function Export-LogsConfig {
