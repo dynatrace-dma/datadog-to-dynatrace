@@ -969,18 +969,77 @@ export_simple_list() {
     rm -f "$tmp" "$hdr"
 }
 
+# ---------------------------------------------------------------------------
+# Paginate a DD v2 endpoint that returns {"data":[...]} across multiple pages.
+# Accumulates all elements and writes {"data":[...]} to the output file.
+# $1=label  $2=base-endpoint  $3=out-file  $4=page-size
+# $5=page-index-param (default: page%5Bnumber%5D, offset-based uses page%5Boffset%5D)
+# $6=page-size-param  (default: page%5Bsize%5D, powerpacks uses page%5Blimit%5D)
+# Offset-style params (name contains "offset") increment by page_size per iteration.
+# ---------------------------------------------------------------------------
+export_paginated_data_endpoint() {
+    local label="$1" base_ep="$2" out_file="$3" page_size="${4:-100}"
+    local param_idx="${5:-page%5Bnumber%5D}" param_size="${6:-page%5Bsize%5D}"
+    mkdir -p "$(dirname "$out_file")"
+    local page=0 elems_file page_failed=false
+    elems_file=$(mktemp); : > "$elems_file"
+    while true; do
+        local tmp; tmp=$(mktemp)
+        if dd_api_call "GET" "${base_ep}?${param_idx}=${page}&${param_size}=${page_size}" "$tmp"; then
+            local batch; batch=$(json_get_raw "$(cat "$tmp")" data)
+            [ -z "$batch" ] && batch="[]"
+            local n; n=$(json_len "$batch")
+            rm -f "$tmp"
+            [ "$n" -eq 0 ] && break
+            json_split_array "$batch" >> "$elems_file"
+            case "$param_idx" in *offset*) page=$((page + page_size)) ;; *) page=$((page + 1)) ;; esac
+            [ "$n" -lt "$page_size" ] && break
+        else
+            log WARNING "  $label: page fetch failed at ${param_idx}=${page}"
+            rm -f "$tmp"; page_failed=true; break
+        fi
+    done
+    local all_data; all_data="[$(paste -sd, "$elems_file" 2>/dev/null)]"
+    rm -f "$elems_file"
+    echo "{\"data\": $all_data}" > "$out_file"
+    local count; count=$(json_len "$all_data")
+    if [[ "$page_failed" == "true" ]]; then
+        log WARNING "  $label: $count fetched (export may be incomplete)"
+        ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + 1))
+    elif [[ "$count" -eq 0 ]]; then
+        log INFO "  $label: 0 (accessible, empty)"
+    else
+        log SUCCESS "  $label: $count"
+    fi
+}
+
 # Export the full breadth of remaining single-call configuration resources.
 # Each is best-effort: empty or scope-gated resources are noted and skipped so
 # the same script exports them automatically wherever the data/scopes exist.
 export_additional_resources() {
     print_step "Exporting Additional Resources"
 
+    # Endpoints that require pagination (small default page sizes risk truncation)
+    export_paginated_data_endpoint \
+        "Security monitoring rules" "/api/v2/security_monitoring/rules" \
+        "$OUTPUT_DIR/security/monitoring_rules.json" 100
+    export_paginated_data_endpoint \
+        "Service definitions (Software Catalog)" "/api/v2/services/definitions" \
+        "$OUTPUT_DIR/service_catalog/definitions.json" 100
+    export_paginated_data_endpoint \
+        "Incidents" "/api/v2/incidents" \
+        "$OUTPUT_DIR/incidents/_list.json" 1000 \
+        "page%5Boffset%5D" "page%5Bsize%5D"
+    export_paginated_data_endpoint \
+        "Powerpacks" "/api/v2/powerpacks" \
+        "$OUTPUT_DIR/powerpacks/_list.json" 100 \
+        "page%5Boffset%5D" "page%5Blimit%5D"
+
     # label | API endpoint | output file (relative to OUTPUT_DIR)
     local rows=(
         # Visualization & content
         "Notebooks|/api/v1/notebooks|notebooks/_list.json"
         "Dashboard lists|/api/v1/dashboard/lists/manual|dashboards/lists.json"
-        "Powerpacks|/api/v2/powerpacks|powerpacks/_list.json"
         # Monitoring extras
         "SLO corrections|/api/v1/slo/correction|slos/corrections.json"
         "Monitor config policies|/api/v2/monitor/policy|monitors/config_policies.json"
@@ -997,10 +1056,7 @@ export_additional_resources() {
         "Synthetics global variables|/api/v1/synthetics/variables|synthetics/global_variables.json"
         "Synthetics private locations|/api/v1/synthetics/locations|synthetics/locations.json"
         # Security / catalog / reference
-        "Security monitoring rules|/api/v2/security_monitoring/rules|security/monitoring_rules.json"
-        "Service definitions (Software Catalog)|/api/v2/services/definitions|service_catalog/definitions.json"
         "Reference tables|/api/v2/reference-tables/tables|reference_tables/_list.json"
-        "Incidents|/api/v2/incidents|incidents/_list.json"
         # Org / access
         "Authn mappings|/api/v2/authn_mappings|users/authn_mappings.json"
         # Integrations
@@ -1467,6 +1523,7 @@ export_slos() {
             local batch_count=$(json_len "$batch")
 
             if [[ "$batch_count" -eq 0 ]]; then
+                rm -f "$temp_file"
                 break
             fi
 
