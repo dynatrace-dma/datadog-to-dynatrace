@@ -793,7 +793,12 @@ function Export-Dashboards {
             -BatchDelaySec $script:DashboardBatchDelay
         $exported = (Get-ChildItem -Path $dir -Filter "dashboard-*.json" -ErrorAction SilentlyContinue).Count
         $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
-        Write-Log SUCCESS "Exported $exported / $($items.Count) dashboards"
+        if ($exported -lt $items.Count) {
+            Write-Log WARNING "Exported $exported / $($items.Count) dashboards ($($items.Count - $exported) failed or rate-limited)"
+            $script:ErrorsEncountered += ($items.Count - $exported)
+        } else {
+            Write-Log SUCCESS "Exported $exported / $($items.Count) dashboards"
+        }
     }
 }
 
@@ -810,13 +815,21 @@ function Export-Monitors {
     $allItems = [System.Collections.Generic.List[object]]::new()
     $page = 0
     $pageSize = 5000
+    $paginationIncomplete = $false
     do {
-        $batch = Invoke-DataDogApi -Method GET `
+        $raw = Invoke-DataDogApi -Method GET `
             -Endpoint "/api/v1/monitor?page=${page}&page_size=${pageSize}"
-        if ($null -eq $batch -or -not ($batch -is [array]) -or $batch.Count -eq 0) { break }
+        if ($null -eq $raw) { Write-Log WARNING "Failed to fetch monitors at page $page"; $paginationIncomplete = $true; break }
+        $batch = @($raw)
+        if ($batch.Count -eq 0) { break }
         foreach ($m in $batch) { [void]$allItems.Add($m) }
         $page++
     } while ($batch.Count -ge $pageSize)
+
+    if ($paginationIncomplete) {
+        Write-Log WARNING "Monitor export may be incomplete (a page failed mid-pagination)"
+        $script:ErrorsEncountered++
+    }
 
     Write-JsonObject -Path (Join-Path $dir "_list.json") -Object $allItems.ToArray()
 
@@ -851,7 +864,7 @@ function Export-LogsConfig {
     $pipelines = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/logs/config/pipelines" `
         -OutputFile (Join-Path $pipDir "_list.json")
     if ($pipelines) {
-        $items = if ($pipelines -is [array]) { $pipelines } else { @() }
+        $items = if ($null -ne $pipelines) { @($pipelines) } else { @() }
         if ($items.Count -eq 0) {
             Track-EmptyResult -ResourceType "log pipelines" -ScopeName "logs_read_config"
         } else {
@@ -867,7 +880,12 @@ function Export-LogsConfig {
                 -BatchDelaySec $script:LogsBatchDelay
             $exported = (Get-ChildItem -Path $pipDir -Filter "pipeline-*.json" -ErrorAction SilentlyContinue).Count
             $script:TotalApiCalls += $exported; $script:SuccessfulApiCalls += $exported
-            Write-Log SUCCESS "Exported $exported / $($items.Count) log pipelines"
+            if ($exported -lt $items.Count) {
+                Write-Log WARNING "Exported $exported / $($items.Count) log pipelines ($($items.Count - $exported) failed or rate-limited)"
+                $script:ErrorsEncountered += ($items.Count - $exported)
+            } else {
+                Write-Log SUCCESS "Exported $exported / $($items.Count) log pipelines"
+            }
         }
     } else { Write-Log WARNING "Failed to fetch log pipelines" }
 
@@ -877,14 +895,23 @@ function Export-LogsConfig {
     if ($idxData) {
         $items = if ($idxData.indexes) { @($idxData.indexes) } else { @() }
         Write-Log SUCCESS "Found $($items.Count) log indexes"
-        $i = 0
+        $i = 0; $idxFailed = 0
         foreach ($idx in $items) {
             $i++; Show-Progress $i $items.Count
             $safe = $idx.name -replace '[/\\]', '_'
-            Invoke-DataDogApi -Method GET -Endpoint "/api/v1/logs/config/indexes/$($idx.name)" `
-                -OutputFile (Join-Path $idxDir "index-${safe}.json") | Out-Null
+            $r = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/logs/config/indexes/$($idx.name)" `
+                -OutputFile (Join-Path $idxDir "index-${safe}.json")
+            if ($null -eq $r) { $idxFailed++ }
         }
-        if ($items.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($items.Count) log indexes" }
+        if ($items.Count -gt 0) {
+            Write-Host ""
+            if ($idxFailed -gt 0) {
+                Write-Log WARNING "Exported $($items.Count - $idxFailed) / $($items.Count) log indexes ($idxFailed failed)"
+                $script:ErrorsEncountered += $idxFailed
+            } else {
+                Write-Log SUCCESS "Exported $($items.Count) log indexes"
+            }
+        }
     } else { Write-Log WARNING "Failed to fetch log indexes" }
 }
 
@@ -903,14 +930,19 @@ function Export-Synthetics {
     $allTests = [System.Collections.Generic.List[object]]::new()
     $page = 0
     $pageSize = 5000
+    $paginationIncomplete = $false
     while ($true) {
         $data = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/synthetics/tests?page=$page&page_size=$pageSize"
-        if ($null -eq $data) { Write-Log WARNING "Failed to fetch synthetic tests at page $page"; break }
+        if ($null -eq $data) { Write-Log WARNING "Failed to fetch synthetic tests at page $page"; $paginationIncomplete = $true; break }
         $batch = if ($data.tests) { @($data.tests) } else { @() }
         if ($batch.Count -eq 0) { break }
         foreach ($t in $batch) { $allTests.Add($t) }
         $page++
         if ($batch.Count -lt $pageSize) { break }
+    }
+    if ($paginationIncomplete) {
+        Write-Log WARNING "Synthetic test export may be incomplete (a page failed mid-pagination)"
+        $script:ErrorsEncountered++
     }
 
     # Persist the master list exactly like the bash exporter: {"tests":[...]}.
@@ -951,7 +983,13 @@ function Export-Synthetics {
             -BatchDelaySec $script:SyntheticsBatchDelay
     }
 
-    Write-Log SUCCESS "Exported $count synthetic tests ($($browserIds.Count) browser w/ full steps)"
+    $exportedTests = (Get-ChildItem -Path $dir -Filter "test-*.json" -ErrorAction SilentlyContinue).Count
+    if ($exportedTests -lt $count) {
+        Write-Log WARNING "Exported $exportedTests / $count synthetic tests ($($browserIds.Count) browser w/ full steps, $($count - $exportedTests) failed)"
+        $script:ErrorsEncountered += ($count - $exportedTests)
+    } else {
+        Write-Log SUCCESS "Exported $count synthetic tests ($($browserIds.Count) browser w/ full steps)"
+    }
 }
 
 function Export-SLOs {
@@ -963,13 +1001,19 @@ function Export-SLOs {
     Write-Log INFO "Fetching SLOs..."
     $allSlos = [System.Collections.Generic.List[object]]::new()
     $offset = 0; $limit = 1000
+    $paginationIncomplete = $false
     do {
         $data = Invoke-DataDogApi -Method GET -Endpoint ('/api/v1/slo?offset={0}&limit={1}' -f $offset, $limit)
-        if ($null -eq $data) { Write-Log ERROR "Failed to fetch SLOs at offset $offset"; break }
+        if ($null -eq $data) { Write-Log WARNING "Failed to fetch SLOs at offset $offset"; $paginationIncomplete = $true; break }
         $batch = if ($data.data) { @($data.data) } else { @() }
         foreach ($s in $batch) { $allSlos.Add($s) }
         $offset += $limit
     } while ($batch.Count -eq $limit)
+
+    if ($paginationIncomplete) {
+        Write-Log WARNING "SLO list export may be incomplete (a page failed mid-pagination)"
+        $script:ErrorsEncountered++
+    }
 
     Write-JsonObject -Path (Join-Path $dir "_list.json") -Object @{ data = $allSlos.ToArray() }
     if ($allSlos.Count -eq 0) {
@@ -977,13 +1021,22 @@ function Export-SLOs {
     } else {
         Write-Log SUCCESS "Found $($allSlos.Count) SLOs"
     }
-    $i = 0
+    $i = 0; $sloFailed = 0
     foreach ($slo in $allSlos) {
         $i++; Show-Progress $i $allSlos.Count
-        Invoke-DataDogApi -Method GET -Endpoint "/api/v1/slo/$($slo.id)" `
-            -OutputFile (Join-Path $dir "slo-$($slo.id).json") | Out-Null
+        $r = Invoke-DataDogApi -Method GET -Endpoint "/api/v1/slo/$($slo.id)" `
+            -OutputFile (Join-Path $dir "slo-$($slo.id).json")
+        if ($null -eq $r) { $sloFailed++ }
     }
-    if ($allSlos.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($allSlos.Count) SLOs" }
+    if ($allSlos.Count -gt 0) {
+        Write-Host ""
+        if ($sloFailed -gt 0) {
+            Write-Log WARNING "Exported $($allSlos.Count - $sloFailed) / $($allSlos.Count) SLOs ($sloFailed failed)"
+            $script:ErrorsEncountered += $sloFailed
+        } else {
+            Write-Log SUCCESS "Exported $($allSlos.Count) SLOs"
+        }
+    }
 }
 
 function Export-Downtimes {
@@ -991,20 +1044,46 @@ function Export-Downtimes {
     $dir = Join-Path $script:OutputDir "downtimes"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-    Write-Log INFO "Fetching downtimes..."
-    $data = Invoke-DataDogApi -Method GET -Endpoint "/api/v2/downtime" `
-        -OutputFile (Join-Path $dir "_list.json")
-    if ($null -eq $data) { Write-Log WARNING "Failed to fetch downtimes"; return }
+    Write-Log INFO "Fetching downtimes (paginated)..."
+    $allDowntimes = [System.Collections.Generic.List[object]]::new()
+    $offset = 0; $limit = 1000
+    $paginationIncomplete = $false
+    do {
+        $data = Invoke-DataDogApi -Method GET `
+            -Endpoint "/api/v2/downtime?page[limit]=${limit}&page[offset]=${offset}"
+        if ($null -eq $data) {
+            Write-Log WARNING "Failed to fetch downtimes at offset $offset"
+            $paginationIncomplete = $true; break
+        }
+        $batch = if ($data.data) { @($data.data) } else { @() }
+        foreach ($dt in $batch) { $allDowntimes.Add($dt) }
+        $offset += $limit
+    } while ($batch.Count -eq $limit)
 
-    $items = if ($data.data) { @($data.data) } else { @() }
-    Write-Log SUCCESS "Found $($items.Count) downtimes"
-    $i = 0
-    foreach ($dt in $items) {
-        $i++; Show-Progress $i $items.Count
-        Invoke-DataDogApi -Method GET -Endpoint "/api/v2/downtime/$($dt.id)" `
-            -OutputFile (Join-Path $dir "downtime-$($dt.id).json") | Out-Null
+    if ($paginationIncomplete) {
+        Write-Log WARNING "Downtime export may be incomplete (a page failed mid-pagination)"
+        $script:ErrorsEncountered++
     }
-    if ($items.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($items.Count) downtimes" }
+
+    Write-JsonObject -Path (Join-Path $dir "_list.json") -Object @{ data = $allDowntimes.ToArray() }
+    Write-Log SUCCESS "Found $($allDowntimes.Count) downtimes"
+
+    $i = 0; $dtFailed = 0
+    foreach ($dt in $allDowntimes) {
+        $i++; Show-Progress $i $allDowntimes.Count
+        $r = Invoke-DataDogApi -Method GET -Endpoint "/api/v2/downtime/$($dt.id)" `
+            -OutputFile (Join-Path $dir "downtime-$($dt.id).json")
+        if ($null -eq $r) { $dtFailed++ }
+    }
+    if ($allDowntimes.Count -gt 0) {
+        Write-Host ""
+        if ($dtFailed -gt 0) {
+            Write-Log WARNING "Exported $($allDowntimes.Count - $dtFailed) / $($allDowntimes.Count) downtimes ($dtFailed failed)"
+            $script:ErrorsEncountered += $dtFailed
+        } else {
+            Write-Log SUCCESS "Exported $($allDowntimes.Count) downtimes"
+        }
+    }
 }
 
 function Export-Metrics {
@@ -1039,17 +1118,26 @@ function Export-Webhooks {
         -OutputFile (Join-Path $dir "_list.json")
     if ($null -eq $data) { Write-Log WARNING "Failed to fetch webhooks"; return }
 
-    $items = if ($data -is [array]) { $data } else { @() }
+    $items = if ($null -ne $data) { @($data) } else { @() }
     Write-Log SUCCESS "Found $($items.Count) webhooks"
-    $i = 0
+    $i = 0; $whFailed = 0
     foreach ($wh in $items) {
         $i++; Show-Progress $i $items.Count
         $safe = $wh.name -replace '[/ ]', '-'
-        Invoke-DataDogApi -Method GET `
+        $r = Invoke-DataDogApi -Method GET `
             -Endpoint "/api/v1/integration/webhooks/configuration/webhooks/$($wh.name)" `
-            -OutputFile (Join-Path $dir "webhook-${safe}.json") | Out-Null
+            -OutputFile (Join-Path $dir "webhook-${safe}.json")
+        if ($null -eq $r) { $whFailed++ }
     }
-    if ($items.Count -gt 0) { Write-Host ""; Write-Log SUCCESS "Exported $($items.Count) webhooks" }
+    if ($items.Count -gt 0) {
+        Write-Host ""
+        if ($whFailed -gt 0) {
+            Write-Log WARNING "Exported $($items.Count - $whFailed) / $($items.Count) webhooks ($whFailed failed)"
+            $script:ErrorsEncountered += $whFailed
+        } else {
+            Write-Log SUCCESS "Exported $($items.Count) webhooks"
+        }
+    }
 }
 
 function Export-UsersTeams {
@@ -1058,22 +1146,88 @@ function Export-UsersTeams {
     $dir = Join-Path $script:OutputDir "users"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
+    # Users, roles, and teams all paginate via page[number]/page[size] + {"data":[...]}
     @(
-        @{ Endpoint = "/api/v2/users"; File = "users.json"; Key = "data"; Label = "users" },
-        @{ Endpoint = "/api/v2/roles"; File = "roles.json"; Key = "data"; Label = "roles" },
-        @{ Endpoint = "/api/v2/team";  File = "teams.json"; Key = "data"; Label = "teams" }
+        @{ Endpoint = "/api/v2/users"; File = "users.json"; Label = "users";  PageSize = 1000; EmptyScope = "user_access_read" },
+        @{ Endpoint = "/api/v2/roles"; File = "roles.json"; Label = "roles";  PageSize = 200;  EmptyScope = $null },
+        @{ Endpoint = "/api/v2/team";  File = "teams.json"; Label = "teams";  PageSize = 100;  EmptyScope = $null }
     ) | ForEach-Object {
-        Write-Log INFO "Fetching $($_.Label)..."
-        $result = Invoke-DataDogApi -Method GET -Endpoint $_.Endpoint `
-            -OutputFile (Join-Path $dir $_.File)
-        if ($result) {
-            $count = if ($result.($_.Key)) { $result.($_.Key).Count } else { 0 }
-            if ($count -eq 0 -and $_.Label -eq "users") {
-                Track-EmptyResult -ResourceType "users" -ScopeName "user_access_read"
-            } else {
-                Write-Log SUCCESS "Exported $count $($_.Label)"
+        $ep = $_
+        Write-Log INFO "Fetching $($ep.Label) (paginated)..."
+        $all = [System.Collections.Generic.List[object]]::new()
+        $pgNum = 0
+        $pgFailed = $false
+        do {
+            $data = Invoke-DataDogApi -Method GET `
+                -Endpoint "$($ep.Endpoint)?page[number]=${pgNum}&page[size]=$($ep.PageSize)"
+            if ($null -eq $data) {
+                Write-Log WARNING "Failed to fetch $($ep.Label) at page $pgNum"
+                $pgFailed = $true; break
             }
-        } else { Write-Log WARNING "Failed to fetch $($_.Label)" }
+            $batch = if ($data.data) { @($data.data) } else { @() }
+            foreach ($item in $batch) { $all.Add($item) }
+            $pgNum++
+        } while ($batch.Count -eq $ep.PageSize)
+
+        Write-JsonObject -Path (Join-Path $dir $ep.File) -Object @{ data = $all.ToArray() }
+
+        if ($pgFailed) {
+            Write-Log WARNING "$($ep.Label): $($all.Count) fetched (export may be incomplete)"
+            $script:ErrorsEncountered++
+        } elseif ($all.Count -eq 0 -and $ep.EmptyScope) {
+            Track-EmptyResult -ResourceType $ep.Label -ScopeName $ep.EmptyScope
+        } else {
+            Write-Log SUCCESS "Exported $($all.Count) $($ep.Label)"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Paginate a DD v2 endpoint that returns {"data":[...]} across multiple pages.
+# Accumulates all elements and writes {"data":[...]} to the output file.
+# PageIndexParam / PageSizeParam default to page[number]/page[size] (0-indexed).
+# Offset-style params (name contains 'offset') increment by PageSize per step.
+# ---------------------------------------------------------------------------
+function Export-PaginatedDataEndpoint {
+    param(
+        [string]$Label,
+        [string]$BaseEndpoint,
+        [string]$OutFile,
+        [int]$PageSize = 100,
+        [string]$PageIndexParam = 'page[number]',
+        [string]$PageSizeParam  = 'page[size]'
+    )
+
+    $outDir = Split-Path -Parent $OutFile
+    if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
+    $allItems = [System.Collections.Generic.List[object]]::new()
+    $page = 0
+    $incomplete = $false
+
+    while ($true) {
+        $endpoint = "${BaseEndpoint}?${PageIndexParam}=${page}&${PageSizeParam}=${PageSize}"
+        $data = Invoke-DataDogApi -Method GET -Endpoint $endpoint
+        if ($null -eq $data) {
+            Write-Log WARNING "  ${Label}: page fetch failed at ${PageIndexParam}=${page}"
+            $incomplete = $true; break
+        }
+        $batch = if ($data.data) { @($data.data) } else { @() }
+        if ($batch.Count -eq 0) { break }
+        foreach ($item in $batch) { $allItems.Add($item) }
+        if ($PageIndexParam -match 'offset') { $page += $PageSize } else { $page++ }
+        if ($batch.Count -lt $PageSize) { break }
+    }
+
+    Write-JsonObject -Path $OutFile -Object @{ data = $allItems.ToArray() }
+
+    if ($incomplete) {
+        Write-Log WARNING "  ${Label}: $($allItems.Count) fetched (export may be incomplete)"
+        $script:ErrorsEncountered++
+    } elseif ($allItems.Count -eq 0) {
+        Write-Log INFO "  ${Label}: 0 (accessible, empty)"
+    } else {
+        Write-Log SUCCESS "  ${Label}: $($allItems.Count)"
     }
 }
 
@@ -1144,11 +1298,30 @@ function Export-SimpleList {
 function Export-AdditionalResources {
     Write-Step "Exporting Additional Resources"
 
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+
+    # Endpoints that require pagination (small default page sizes risk truncation)
+    Export-PaginatedDataEndpoint -Label 'Security monitoring rules' `
+        -BaseEndpoint '/api/v2/security_monitoring/rules' `
+        -OutFile (Join-Path $script:OutputDir ('security/monitoring_rules.json' -replace '/', $sep)) `
+        -PageSize 100
+    Export-PaginatedDataEndpoint -Label 'Service definitions (Software Catalog)' `
+        -BaseEndpoint '/api/v2/services/definitions' `
+        -OutFile (Join-Path $script:OutputDir ('service_catalog/definitions.json' -replace '/', $sep)) `
+        -PageSize 100
+    Export-PaginatedDataEndpoint -Label 'Incidents' `
+        -BaseEndpoint '/api/v2/incidents' `
+        -OutFile (Join-Path $script:OutputDir ('incidents/_list.json' -replace '/', $sep)) `
+        -PageSize 1000 -PageIndexParam 'page[offset]' -PageSizeParam 'page[size]'
+    Export-PaginatedDataEndpoint -Label 'Powerpacks' `
+        -BaseEndpoint '/api/v2/powerpacks' `
+        -OutFile (Join-Path $script:OutputDir ('powerpacks/_list.json' -replace '/', $sep)) `
+        -PageSize 100 -PageIndexParam 'page[offset]' -PageSizeParam 'page[limit]'
+
     $rows = @(
         # Visualization & content
         @{ L = 'Notebooks';                            E = '/api/v1/notebooks';                       O = 'notebooks/_list.json' }
         @{ L = 'Dashboard lists';                      E = '/api/v1/dashboard/lists/manual';          O = 'dashboards/lists.json' }
-        @{ L = 'Powerpacks';                           E = '/api/v2/powerpacks';                      O = 'powerpacks/_list.json' }
         # Monitoring extras
         @{ L = 'SLO corrections';                      E = '/api/v1/slo/correction';                  O = 'slos/corrections.json' }
         @{ L = 'Monitor config policies';              E = '/api/v2/monitor/policy';                  O = 'monitors/config_policies.json' }
@@ -1165,10 +1338,7 @@ function Export-AdditionalResources {
         @{ L = 'Synthetics global variables';          E = '/api/v1/synthetics/variables';            O = 'synthetics/global_variables.json' }
         @{ L = 'Synthetics private locations';         E = '/api/v1/synthetics/locations';            O = 'synthetics/locations.json' }
         # Security / catalog / reference
-        @{ L = 'Security monitoring rules';            E = '/api/v2/security_monitoring/rules';       O = 'security/monitoring_rules.json' }
-        @{ L = 'Service definitions (Software Catalog)'; E = '/api/v2/services/definitions';          O = 'service_catalog/definitions.json' }
         @{ L = 'Reference tables';                     E = '/api/v2/reference-tables/tables';         O = 'reference_tables/_list.json' }
-        @{ L = 'Incidents';                            E = '/api/v2/incidents';                       O = 'incidents/_list.json' }
         # Org / access
         @{ L = 'Authn mappings';                       E = '/api/v2/authn_mappings';                  O = 'users/authn_mappings.json' }
         # Integrations
@@ -1181,7 +1351,6 @@ function Export-AdditionalResources {
         @{ L = 'Host tags';                            E = '/api/v1/tags/hosts';                      O = 'infra/host_tags.json' }
     )
 
-    $sep = [System.IO.Path]::DirectorySeparatorChar
     foreach ($r in $rows) {
         $out = Join-Path $script:OutputDir ($r.O -replace '/', $sep)
         Export-SimpleList -Label $r.L -Endpoint $r.E -OutFile $out
