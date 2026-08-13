@@ -864,7 +864,7 @@ fetch_ids_concurrent() {
     local id out
     for id in "${ids[@]}"; do
         out="${out_tmpl//__ID__/$id}"
-        if [ ! -f "$out" ] || grep -q '"status":429\|"errors":\["Too many requests' "$out" 2>/dev/null; then
+        if [ ! -f "$out" ] || grep -qi '"status":429\|"errors":' "$out" 2>/dev/null; then
             retry_ids+=("$id")
             rm -f "$out"
         fi
@@ -908,6 +908,16 @@ fetch_ids_concurrent() {
         [ "$retry_start" -lt "$retry_total" ] && sleep "$retry_delay"
     done
     echo ""
+
+    # Post-retry: remove files that still contain an error envelope
+    # (rate limit exhausted or authorization failure on specific assets)
+    for id in "${retry_ids[@]}"; do
+        out="${out_tmpl//__ID__/$id}"
+        if [ -f "$out" ] && grep -qi '"errors":' "$out" 2>/dev/null; then
+            log WARNING "  Permanent failure after retry: $id — file removed"
+            rm -f "$out"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1081,7 @@ export_dashboards() {
     local all_dashboards="[]"
     local total_fetched=0
     local elems_file=$(mktemp); : > "$elems_file"
+    local page_failed=false
 
     while true; do
         local temp_file=$(mktemp)
@@ -1099,9 +1110,15 @@ export_dashboards() {
         else
             log WARNING "Failed to fetch dashboards at offset $offset"
             rm -f "$temp_file"
+            page_failed=true
             break
         fi
     done
+
+    if [[ "$page_failed" == "true" ]]; then
+        log WARNING "Dashboard export may be incomplete (a page failed mid-pagination)"
+        ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + 1))
+    fi
 
     # Build the full array from accumulated elements (no jq merge)
     all_dashboards="[$(paste -sd, "$elems_file" 2>/dev/null)]"
@@ -1130,7 +1147,12 @@ export_dashboards() {
         local exported=$(ls "$dashboards_dir"/dashboard-*.json 2>/dev/null | wc -l | tr -d ' ')
         TOTAL_API_CALLS=$((TOTAL_API_CALLS + exported))
         SUCCESSFUL_API_CALLS=$((SUCCESSFUL_API_CALLS + exported))
-        log SUCCESS "Exported $exported / $count dashboards"
+        if [[ "$exported" -lt "$count" ]]; then
+            log WARNING "Exported $exported / $count dashboards ($((count - exported)) failed or rate-limited)"
+            ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + count - exported))
+        else
+            log SUCCESS "Exported $exported / $count dashboards"
+        fi
     fi
 
     return 0
@@ -1157,6 +1179,7 @@ export_monitors() {
     local all_monitors="[]"
     local total_fetched=0
     local elems_file=$(mktemp); : > "$elems_file"
+    local page_failed=false
 
     while true; do
         local temp_file=$(mktemp)
@@ -1183,9 +1206,15 @@ export_monitors() {
         else
             log WARNING "Failed to fetch monitors at page $page"
             rm -f "$temp_file"
+            page_failed=true
             break
         fi
     done
+
+    if [[ "$page_failed" == "true" ]]; then
+        log WARNING "Monitor export may be incomplete (a page failed mid-pagination)"
+        ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + 1))
+    fi
 
     # Build the full array from accumulated elements (no jq merge)
     all_monitors="[$(paste -sd, "$elems_file" 2>/dev/null)]"
@@ -1278,17 +1307,25 @@ export_logs_config() {
             local index_names=$(json_pluck "$(json_get_raw "$(cat "$indexes_list")" indexes)" name)
 
             local current=0
+            local index_failed=0
             while IFS= read -r index_name; do
                 current=$((current + 1))
                 show_progress $current $count
 
                 local safe_name=$(echo "$index_name" | tr '/' '_')
                 local output_file="$logs_dir/indexes/index-${safe_name}.json"
-                dd_api_call "GET" "/api/v1/logs/config/indexes/${index_name}" "$output_file" >/dev/null 2>&1
+                if ! dd_api_call "GET" "/api/v1/logs/config/indexes/${index_name}" "$output_file"; then
+                    index_failed=$((index_failed + 1))
+                fi
 
             done <<< "$index_names"
             echo ""
-            log SUCCESS "Exported $count log indexes"
+            if [[ "$index_failed" -gt 0 ]]; then
+                log WARNING "Exported $((count - index_failed)) / $count log indexes ($index_failed failed)"
+                ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + index_failed))
+            else
+                log SUCCESS "Exported $count log indexes"
+            fi
         fi
     else
         log WARNING "Failed to fetch log indexes"
@@ -1317,6 +1354,7 @@ export_synthetics() {
     local page_size=5000  # Maximum supported by DataDog API
     local all_tests="[]"
     local elems_file=$(mktemp); : > "$elems_file"
+    local page_failed=false
 
     while true; do
         local temp_file=$(mktemp)
@@ -1341,9 +1379,15 @@ export_synthetics() {
         else
             log WARNING "Failed to fetch synthetic tests at page $page"
             rm -f "$temp_file"
+            page_failed=true
             break
         fi
     done
+
+    if [[ "$page_failed" == "true" ]]; then
+        log WARNING "Synthetic test export may be incomplete (a page failed mid-pagination)"
+        ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + 1))
+    fi
 
     all_tests="[$(paste -sd, "$elems_file" 2>/dev/null)]"
     rm -f "$elems_file"
@@ -1381,7 +1425,13 @@ export_synthetics() {
                 "$SYNTHETICS_BATCH_SIZE" "$SYNTHETICS_BATCH_DELAY"
         fi
 
-        log SUCCESS "Exported $count synthetic tests ($browser_count browser w/ full steps)"
+        local exported_tests=$(ls "$synthetics_dir"/test-*.json 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$exported_tests" -lt "$count" ]]; then
+            log WARNING "Exported $exported_tests / $count synthetic tests ($browser_count browser w/ full steps, $((count - exported_tests)) failed)"
+            ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + count - exported_tests))
+        else
+            log SUCCESS "Exported $count synthetic tests ($browser_count browser w/ full steps)"
+        fi
     fi
 
     return 0
@@ -1407,6 +1457,7 @@ export_slos() {
     local limit=1000
     local all_slos="[]"
     local elems_file=$(mktemp); : > "$elems_file"
+    local page_failed=false
 
     while true; do
         local temp_file=$(mktemp)
@@ -1431,9 +1482,15 @@ export_slos() {
         else
             log ERROR "Failed to fetch SLOs at offset $offset"
             rm -f "$temp_file"
+            page_failed=true
             break
         fi
     done
+
+    if [[ "$page_failed" == "true" ]]; then
+        log WARNING "SLO list export may be incomplete (a page failed mid-pagination)"
+        ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + 1))
+    fi
 
     # Build the full array from accumulated elements (no jq merge)
     all_slos="[$(paste -sd, "$elems_file" 2>/dev/null)]"
@@ -1452,17 +1509,25 @@ export_slos() {
         local slo_ids=$(json_pluck "$all_slos" id)
 
         local current=0
+        local slo_failed=0
         while IFS= read -r slo_id; do
             current=$((current + 1))
             show_progress $current $count
 
             local output_file="$slos_dir/slo-${slo_id}.json"
-            dd_api_call "GET" "/api/v1/slo/${slo_id}" "$output_file" >/dev/null 2>&1
+            if ! dd_api_call "GET" "/api/v1/slo/${slo_id}" "$output_file"; then
+                slo_failed=$((slo_failed + 1))
+            fi
 
         done <<< "$slo_ids"
 
         echo ""
-        log SUCCESS "Exported $count SLOs"
+        if [[ "$slo_failed" -gt 0 ]]; then
+            log WARNING "Exported $((count - slo_failed)) / $count SLOs ($slo_failed failed)"
+            ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + slo_failed))
+        else
+            log SUCCESS "Exported $count SLOs"
+        fi
     fi
 
     return 0
@@ -1483,6 +1548,7 @@ export_downtimes() {
     local limit=1000  # Maximum supported by v2 API
     local all_downtimes="[]"
     local elems_file=$(mktemp); : > "$elems_file"
+    local page_failed=false
 
     while true; do
         local temp_file=$(mktemp)
@@ -1507,9 +1573,15 @@ export_downtimes() {
         else
             log WARNING "Failed to fetch downtimes at offset $offset"
             rm -f "$temp_file"
+            page_failed=true
             break
         fi
     done
+
+    if [[ "$page_failed" == "true" ]]; then
+        log WARNING "Downtime export may be incomplete (a page failed mid-pagination)"
+        ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + 1))
+    fi
 
     all_downtimes="[$(paste -sd, "$elems_file" 2>/dev/null)]"
     rm -f "$elems_file"
@@ -1588,18 +1660,26 @@ export_webhooks() {
             local webhook_names=$(json_pluck "$(cat "$list_file")" name)
 
             local current=0
+            local webhook_failed=0
             while IFS= read -r webhook_name; do
                 current=$((current + 1))
                 show_progress $current $count
 
                 local safe_name=$(echo "$webhook_name" | tr '/' '_' | tr ' ' '-')
                 local output_file="$webhooks_dir/webhook-${safe_name}.json"
-                dd_api_call "GET" "/api/v1/integration/webhooks/configuration/webhooks/${webhook_name}" "$output_file" >/dev/null 2>&1
+                if ! dd_api_call "GET" "/api/v1/integration/webhooks/configuration/webhooks/${webhook_name}" "$output_file"; then
+                    webhook_failed=$((webhook_failed + 1))
+                fi
 
             done <<< "$webhook_names"
 
             echo ""
-            log SUCCESS "Exported $count webhooks"
+            if [[ "$webhook_failed" -gt 0 ]]; then
+                log WARNING "Exported $((count - webhook_failed)) / $count webhooks ($webhook_failed failed)"
+                ERRORS_ENCOUNTERED=$((ERRORS_ENCOUNTERED + webhook_failed))
+            else
+                log SUCCESS "Exported $count webhooks"
+            fi
         fi
     else
         log WARNING "Failed to fetch webhooks"
